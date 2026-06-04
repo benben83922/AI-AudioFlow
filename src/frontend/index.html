@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI AudioFlow</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            "bg-primary":       "#0e1015",
+            "bg-accent":        "#13151b",
+            "bg-card":          "#161920",
+            "bg-input":         "#1e2028",
+            "bg-hover":         "#1f2330",
+            "border-default":   "#1e2028",
+            "border-strong":    "#2e3040",
+            "text-primary":     "#f4f4f5",
+            "text-secondary":   "#d4d4d8",
+            "text-muted":       "#838387",
+            "accent-primary":   "#ff5c5c",
+            "accent-secondary": "#14b8a6",
+            "status-success":   "#22c55e",
+            "status-error":     "#ef4444",
+            "status-info":      "#3b82f6",
+            "warn":             "#f59e0b",
+          },
+          fontFamily: { sans: ["Inter", "sans-serif"] },
+          borderRadius: { sm: "6px", md: "10px", lg: "14px", xl: "20px" },
+        },
+      },
+    };
+  </script>
+
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { -webkit-font-smoothing: antialiased; user-select: none; -webkit-user-select: none; }
+    input, textarea { user-select: text; -webkit-user-select: text; }
+
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 0 12px; height: 40px; border-radius: 12px;
+      font-size: 14px; font-weight: 500; color: #d4d4d8;
+      cursor: pointer; border: 1px solid transparent;
+      transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+      user-select: none;
+    }
+    .nav-item:hover { background-color: #161920; }
+    .nav-item-active, .nav-item-active:hover {
+      background-color: #ff5c5c1a; border-color: #ff5c5c33;
+      color: #f4f4f5; font-weight: 600;
+    }
+    .nav-icon { width: 18px; height: 18px; flex-shrink: 0; color: #838387; transition: color 150ms ease; }
+    .nav-item:hover .nav-icon { color: #d4d4d8; }
+    .nav-item-active .nav-icon { color: #ff5c5c; }
+
+    .checkbox-custom {
+      appearance: none; -webkit-appearance: none;
+      width: 16px; height: 16px; border: 1.5px solid #1e2028;
+      border-radius: 3px; background: transparent; cursor: pointer;
+      flex-shrink: 0; position: relative;
+      transition: background-color 150ms ease, border-color 150ms ease;
+    }
+    .checkbox-custom:checked { background-color: #ff5c5c; border-color: #ff5c5c; }
+    .checkbox-custom:checked::after {
+      content: ""; position: absolute;
+      top: 1px; left: 4px; width: 5px; height: 9px;
+      border: solid white; border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+    .checkbox-custom:hover { border-color: #838387; }
+
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .animate-spin { animation: spin 1s linear infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .animate-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2a2d35; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3a3d45; }
+
+    .page { display: none; }
+    .page.active { display: flex; flex-direction: column; gap: 1.5rem; }
+  </style>
+</head>
+<body class="bg-bg-primary font-sans text-text-primary m-0 h-screen overflow-hidden flex">
+
+  <!-- ── Loading Splash ── -->
+  <div id="app-loading" class="fixed inset-0 z-50 flex items-center justify-center bg-bg-primary">
+    <div class="bg-bg-card border border-border-default rounded-md p-10 flex flex-col items-center gap-5 min-w-[280px]">
+      <div class="w-12 h-12 rounded-md bg-accent-primary flex items-center justify-center">
+        <i data-lucide="audio-waveform" class="w-6 h-6 text-white"></i>
+      </div>
+      <div class="text-center">
+        <h1 class="text-xl font-bold">AI AudioFlow</h1>
+        <p class="text-text-muted text-sm mt-1">自動錄音摘要系統</p>
+      </div>
+      <div class="flex items-center gap-2 text-text-muted text-sm">
+        <i data-lucide="loader" class="w-4 h-4 animate-spin"></i>
+        <span id="loading-text">連接後端服務中...</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── App Shell（隱藏至初始化完成）── -->
+  <div id="app-main" class="hidden flex-1 h-screen overflow-hidden flex">
+
+    <!-- Sidebar -->
+    <aside class="w-56 h-screen bg-bg-accent flex flex-col flex-shrink-0 border-r border-border-default">
+      <div class="px-4 py-5 flex items-center gap-3 border-b border-border-default">
+        <div class="w-9 h-9 rounded-md bg-accent-primary flex items-center justify-center flex-shrink-0">
+          <i data-lucide="audio-waveform" class="w-5 h-5 text-white"></i>
+        </div>
+        <div>
+          <div class="text-sm font-bold">AI AudioFlow</div>
+          <div class="text-[11px] text-text-muted" id="app-version">v0.1.0</div>
+        </div>
+      </div>
+
+      <nav class="flex-1 p-3 flex flex-col gap-1 overflow-y-auto">
+        <div class="nav-item nav-item-active" onclick="navigateTo('dashboard')">
+          <i data-lucide="layout-dashboard" class="nav-icon"></i><span>儀表板</span>
+        </div>
+        <div class="nav-item" onclick="navigateTo('recording')">
+          <i data-lucide="mic" class="nav-icon"></i><span>音訊擷取</span>
+        </div>
+        <div class="nav-item" onclick="navigateTo('processing')">
+          <i data-lucide="cpu" class="nav-icon"></i><span>AI 處理</span>
+        </div>
+        <div class="nav-item" onclick="navigateTo('distribution')">
+          <i data-lucide="send" class="nav-icon"></i><span>自動分發</span>
+        </div>
+        <div class="mt-auto pt-2 border-t border-border-default">
+          <div class="nav-item" onclick="navigateTo('settings')">
+            <i data-lucide="settings" class="nav-icon"></i><span>設定</span>
+          </div>
+        </div>
+      </nav>
+
+      <div class="px-4 py-3 border-t border-border-default">
+        <div id="service-status" class="flex items-center gap-2">
+          <div class="w-2 h-2 rounded-full bg-text-muted"></div>
+          <span class="text-xs text-text-muted">初始化中...</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="flex-1 h-screen overflow-y-auto bg-bg-primary">
+      <div class="p-6 flex flex-col gap-6 max-w-5xl">
+
+        <div id="page-dashboard"    class="page active"></div>
+        <div id="page-recording"    class="page"></div>
+        <div id="page-processing"   class="page"></div>
+        <div id="page-distribution" class="page"></div>
+        <div id="page-settings"     class="page"></div>
+
+      </div>
+    </main>
+  </div>
+
+  <script>
+  // ════════════════════════════════════════════
+  // 工具函式（ported from openclaw/core.js）
+  // ════════════════════════════════════════════
+
+  function esc(s) {
+    if (s == null) return "";
+    return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  }
+
+  function refreshIcons() { lucide.createIcons({ nameAttr: "data-lucide" }); }
+
+  function renderInto(id, html) {
+    const el = document.getElementById(id);
+    if (el) { el.innerHTML = html; refreshIcons(); }
+  }
+
+  // Toast（openclaw/core.js:78）
+  function showToast(message, type = "success", duration = 4000) {
+    const colors = { success:"bg-status-success text-white", warning:"bg-warn text-white", error:"bg-status-error text-white", info:"bg-status-info text-white" };
+    const icons  = { success:"check-circle", warning:"alert-triangle", error:"x-circle", info:"info" };
+    let c = document.getElementById("toast-container");
+    if (!c) {
+      c = document.createElement("div");
+      c.id = "toast-container";
+      c.className = "fixed top-4 right-4 z-[9999] flex flex-col gap-2";
+      document.body.appendChild(c);
+    }
+    const t = document.createElement("div");
+    t.className = `flex items-center gap-2 px-4 py-3 rounded-md shadow-lg text-sm font-medium ${colors[type]||colors.success} transition-opacity duration-300`;
+    t.innerHTML = `<i data-lucide="${icons[type]||"info"}" class="w-4 h-4"></i><span>${esc(message)}</span>`;
+    c.appendChild(t);
+    refreshIcons();
+    setTimeout(() => { t.classList.add("opacity-0"); setTimeout(() => t.remove(), 300); }, duration);
+  }
+
+  // ════════════════════════════════════════════
+  // Bridge API（ported from openclaw/core.js callApi）
+  // ════════════════════════════════════════════
+
+  async function callApi(method, ...args) {
+    try {
+      const r = await window.pywebview.api[method](...args);
+      return r?.success ? r.data : null;
+    } catch (e) {
+      console.warn("[callApi]", method, e);
+      return null;
+    }
+  }
+
+  async function callApiOrToast(method, errorMsg, ...args) {
+    const result = await callApi(method, ...args);
+    if (result === null) showToast(errorMsg || `操作失敗（${method}）`, "error");
+    return result;
+  }
+
+  // ════════════════════════════════════════════
+  // Confirm Modal（openclaw/components.js:210）
+  // ════════════════════════════════════════════
+
+  let _cbs = null;
+
+  function showConfirmModal({ icon="triangle-alert", iconBg="background:#ef444415", iconColor="text-status-error", title, message, notice, confirmLabel, confirmVariant="danger", onConfirm, onCancel }) {
+    _cbs = { onConfirm, onCancel };
+    const btnCls = confirmVariant === "danger"
+      ? "bg-status-error text-white hover:bg-[#dc2626]"
+      : "bg-accent-primary text-white hover:bg-[#e64d4d]";
+    const noticeHtml = notice
+      ? `<div class="w-full rounded-sm flex items-start gap-2.5" style="background:#f59e0b1a;border-left:3px solid #f59e0b;padding:10px 12px">
+           <i data-lucide="alert-triangle" class="w-4 h-4 text-warn flex-shrink-0 mt-0.5"></i>
+           <div class="text-[12px] text-text-secondary leading-snug">${esc(notice)}</div>
+         </div>` : "";
+    const ov = document.createElement("div");
+    ov.id = "confirm-modal-overlay";
+    ov.className = "fixed inset-0 z-[9000] flex items-center justify-center bg-black/60 backdrop-blur-sm";
+    ov.innerHTML = `
+      <div class="bg-bg-card border border-border-strong rounded-md w-[420px] flex flex-col items-center gap-5" style="padding:32px">
+        <div class="w-14 h-14 rounded-full flex items-center justify-center" style="${iconBg}">
+          <i data-lucide="${esc(icon)}" class="w-8 h-8 ${iconColor}"></i>
+        </div>
+        <div class="text-lg font-bold text-center">${esc(title)}</div>
+        ${message ? `<div class="text-[13px] text-text-secondary text-center leading-relaxed" style="max-width:340px">${esc(message)}</div>` : ""}
+        ${noticeHtml}
+        <div class="flex gap-3 w-full mt-1">
+          <button onclick="_cmCancel()" class="flex-1 inline-flex items-center justify-center gap-2 font-medium rounded-sm px-4 py-2.5 text-sm bg-bg-card text-text-secondary border border-border-default hover:bg-bg-input transition-colors cursor-pointer">取消</button>
+          <button onclick="_cmOk()"     class="flex-1 inline-flex items-center justify-center gap-2 font-medium rounded-sm px-4 py-2.5 text-sm ${btnCls} transition-colors cursor-pointer">
+            <i data-lucide="${esc(icon)}" class="w-4 h-4"></i><span>${esc(confirmLabel)}</span>
+          </button>
+        </div>
+      </div>`;
+    document.body.appendChild(ov);
+    refreshIcons();
+  }
+  function _cmOk()     { const cb = _cbs?.onConfirm; _cmClose(); cb?.(); }
+  function _cmCancel() { const cb = _cbs?.onCancel;  _cmClose(); cb?.(); }
+  function _cmClose()  { _cbs = null; document.getElementById("confirm-modal-overlay")?.remove(); }
+
+  // ════════════════════════════════════════════
+  // UI 元件（openclaw/components.js）
+  // ════════════════════════════════════════════
+
+  function renderButton({ variant="primary", icon, label="", disabled=false, loading=false, id, onclick, size="md" }) {
+    const base = "inline-flex items-center justify-center gap-2 font-medium rounded-sm transition-colors cursor-pointer select-none";
+    const sz   = size === "sm" ? "px-3 py-1.5 text-xs" : "px-4 py-2.5 text-sm";
+    const v    = { primary:"bg-accent-primary text-white hover:bg-[#e64d4d]", secondary:"bg-bg-card text-text-secondary border border-border-default hover:bg-bg-input", danger:"bg-status-error text-white hover:bg-[#dc2626]", warning:"bg-warn text-white hover:bg-[#d97706]", ghost:"bg-transparent text-text-muted hover:text-text-secondary hover:bg-bg-input" };
+    const dis  = disabled || loading ? "opacity-50 pointer-events-none" : "";
+    const ico  = loading ? "loader" : icon;
+    const icoCls = loading ? "animate-spin" : "";
+    return `<button ${id?`id="${id}"`:""}
+      class="${base} ${sz} ${v[variant]||v.primary} ${dis}"
+      ${disabled?"disabled":""}
+      ${onclick&&!disabled?`onclick="${onclick}"`:""}
+    >${ico?`<i data-lucide="${ico}" class="w-4 h-4 ${icoCls}"></i>`:""} ${label?`<span>${label}</span>`:""}</button>`;
+  }
+
+  function renderInput({ id, label, icon, placeholder="", type="text", value="", error, required=false }) {
+    const border = error ? "border-status-error" : "border-border-default focus-within:border-accent-primary";
+    const req = required ? '<span class="text-accent-primary ml-0.5">*</span>' : "";
+    const pw  = type === "password"
+      ? `<button type="button" class="pwd-toggle absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-secondary" onclick="togglePassword('${id}')"><i data-lucide="eye-off" class="w-4 h-4"></i></button>`
+      : "";
+    return `<div class="flex flex-col gap-1.5">
+      ${label?`<label for="${id}" class="text-xs font-medium text-text-secondary">${label}${req}</label>`:""}
+      <div class="relative">
+        ${icon?`<i data-lucide="${icon}" class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-text-muted"></i>`:""}
+        <input id="${id}" name="${id}" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}"
+          class="w-full bg-bg-input border ${border} rounded-sm text-sm text-text-primary placeholder:text-text-muted ${icon?"pl-10":"pl-3"} ${type==="password"?"pr-10":"pr-3"} py-2.5 outline-none transition-colors" />
+        ${pw}
+      </div>
+      ${error?`<span class="text-xs text-status-error">${error}</span>`:""}
+    </div>`;
+  }
+
+  function togglePassword(inputId) {
+    const el = document.getElementById(inputId);
+    if (!el) return;
+    const pw = el.type === "password";
+    el.type = pw ? "text" : "password";
+    const btn = el.parentElement.querySelector(".pwd-toggle i");
+    if (btn) btn.setAttribute("data-lucide", pw ? "eye" : "eye-off");
+    refreshIcons();
+  }
+
+  function renderStatusBadge({ status, text }) {
+    const c = { success:{dot:"bg-status-success",bg:"bg-[#22c55e18]",txt:"text-status-success"}, error:{dot:"bg-status-error",bg:"bg-[#ef444418]",txt:"text-status-error"}, warning:{dot:"bg-[#eab308]",bg:"bg-[#eab30818]",txt:"text-[#eab308]"}, info:{dot:"bg-status-info",bg:"bg-[#3b82f618]",txt:"text-status-info"} }[status] || {dot:"bg-status-info",bg:"bg-[#3b82f618]",txt:"text-status-info"};
+    return `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full ${c.bg} ${c.txt} text-xs font-medium whitespace-nowrap">
+      <span class="w-1.5 h-1.5 rounded-full ${c.dot}"></span>${esc(text)}
+    </span>`;
+  }
+
+  function renderStatCard({ icon, iconColor="text-accent-primary", value, label, badgeStatus, badgeText }) {
+    const badge = badgeStatus ? renderStatusBadge({ status: badgeStatus, text: badgeText }) : "";
+    return `<div class="bg-bg-card border border-border-default rounded-md p-5 flex-1 min-w-0">
+      <div class="flex items-center justify-between mb-3">
+        <div class="w-9 h-9 rounded-sm bg-bg-input flex items-center justify-center">
+          <i data-lucide="${icon}" class="w-[18px] h-[18px] ${iconColor}"></i>
+        </div>
+        ${badge}
+      </div>
+      <div class="text-2xl font-bold">${esc(String(value))}</div>
+      <div class="text-xs text-text-muted mt-1">${esc(label)}</div>
+    </div>`;
+  }
+
+  function renderSectionPanel({ icon, iconColor="text-accent-primary", title, description, children="", id, headerActions="" }) {
+    return `<div ${id?`id="${id}"`:""}  class="bg-bg-card border border-border-default rounded-md">
+      <div class="px-5 pt-5 pb-4 flex items-center gap-3">
+        <div class="w-9 h-9 rounded-sm bg-bg-input flex items-center justify-center flex-shrink-0">
+          <i data-lucide="${icon}" class="w-[18px] h-[18px] ${iconColor}"></i>
+        </div>
+        <div class="${headerActions?"flex-1":""}">
+          <h3 class="text-base font-semibold">${esc(title)}</h3>
+          ${description?`<p class="text-[13px] text-text-secondary mt-0.5">${esc(description)}</p>`:""}
+        </div>
+        ${headerActions}
+      </div>
+      <div class="px-5 pb-5">${children}</div>
+    </div>`;
+  }
+
+  function renderProgressItem({ name, description, status, error }) {
+    const cfg = {
+      done:    { cc:"bg-status-success", icon:"check",  ic:"text-white",                  tc:"text-status-success", lbl:"完成"  },
+      running: { cc:"bg-accent-primary", icon:"loader", ic:"text-white animate-spin",      tc:"text-accent-primary", lbl:"處理中" },
+      pending: { cc:"border-2 border-border-default bg-transparent", icon:null, ic:"",    tc:"text-text-muted",     lbl:"等待中" },
+      failed:  { cc:"bg-status-error",   icon:"x",      ic:"text-white",                  tc:"text-status-error",   lbl:"失敗"  },
+    }[status] || { cc:"border-2 border-border-default bg-transparent", icon:null, ic:"", tc:"text-text-muted", lbl:"等待中" };
+    const circle = cfg.icon ? `<i data-lucide="${cfg.icon}" class="w-3.5 h-3.5 ${cfg.ic}"></i>` : "";
+    const errBlock = status === "failed" && error
+      ? `<div class="bg-red-500/10 rounded-lg p-3 mt-2">
+           <div class="flex items-center gap-1.5 mb-1"><i data-lucide="triangle-alert" class="w-3.5 h-3.5 text-status-error"></i><span class="text-xs font-semibold text-status-error">錯誤詳情</span></div>
+           <pre class="text-xs text-red-400 font-mono whitespace-pre-wrap">${esc(error)}</pre>
+         </div>` : "";
+    return `<div class="py-3 border-b border-border-default last:border-b-0">
+      <div class="flex items-center gap-3">
+        <div class="w-7 h-7 rounded-full ${cfg.cc} flex items-center justify-center flex-shrink-0">${circle}</div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-medium">${esc(name)}</div>
+          ${description?`<div class="text-xs text-text-secondary mt-0.5">${esc(description)}</div>`:""}
+        </div>
+        <span class="text-xs font-medium ${cfg.tc}">${cfg.lbl}</span>
+      </div>${errBlock}
+    </div>`;
+  }
+
+  function renderLoading(msg = "載入中...") {
+    return `<div class="flex items-center gap-3 text-text-muted py-8">
+      <i data-lucide="loader" class="w-5 h-5 animate-spin"></i>
+      <span class="text-sm">${esc(msg)}</span>
+    </div>`;
+  }
+
+  // ════════════════════════════════════════════
+  // 路由
+  // ════════════════════════════════════════════
+
+  function navigateTo(view) {
+    document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+    document.getElementById(`page-${view}`)?.classList.add("active");
+    document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("nav-item-active"));
+    document.querySelector(`.nav-item[onclick="navigateTo('${view}')"]`)?.classList.add("nav-item-active");
+    renderPage(view);
+  }
+
+  function renderPage(v) {
+    ({ dashboard: renderDashboard, recording: renderRecording, processing: renderProcessing, distribution: renderDistribution, settings: renderSettings }[v] || (() => {}))();
+  }
+
+  // ════════════════════════════════════════════
+  // 頁面渲染 — Dashboard
+  // ════════════════════════════════════════════
+
+  async function renderDashboard() {
+    renderInto("page-dashboard", `
+      <div>
+        <h1 class="text-xl font-bold">儀表板</h1>
+        <p class="text-sm text-text-muted mt-0.5">系統狀態總覽</p>
+      </div>
+      <div id="stat-cards" class="flex gap-4">${renderLoading("載入統計...")}</div>
+      <div id="panel-recent">${renderLoading("載入錄音清單...")}</div>
+      <div id="panel-pipeline">${renderLoading("載入處理進度...")}</div>
+    `);
+
+    // Parallel API calls
+    const [stats, recordings, pipeline] = await Promise.all([
+      callApi("get_stats"),
+      callApi("list_recordings"),
+      callApi("get_pipeline_status"),
+    ]);
+
+    // Stat cards
+    renderInto("stat-cards", [
+      renderStatCard({ icon: "mic",       value: stats?.recordings_today     ?? "—", label: "今日錄音次數", iconColor: "text-accent-primary" }),
+      renderStatCard({ icon: "file-text", value: stats?.transcriptions_total ?? "—", label: "已完成轉譯",   iconColor: "text-accent-secondary", badgeStatus: "success", badgeText: "正常" }),
+      renderStatCard({ icon: "send",      value: stats?.distributions_total  ?? "—", label: "已分發筆記",   iconColor: "text-status-info" }),
+    ].join(""));
+
+    // Recent recordings
+    const recRows = recordings?.length
+      ? recordings.slice(0, 5).map(r => _recordingRow(r, false)).join("")
+      : `<div class="py-8 text-center text-sm text-text-muted">尚無錄音紀錄</div>`;
+    renderInto("panel-recent", renderSectionPanel({
+      icon: "clock", iconColor: "text-text-muted",
+      title: "近期錄音", description: `共 ${recordings?.length ?? 0} 筆`,
+      children: recRows,
+    }));
+
+    // Pipeline
+    const pipelineSteps = pipeline?.steps?.map(s => renderProgressItem(s)).join("") || renderLoading("尚無進行中的處理");
+    renderInto("panel-pipeline", renderSectionPanel({
+      icon: "cpu", iconColor: "text-accent-secondary",
+      title: "當前處理進度", description: pipeline?.recording_name || "—",
+      children: pipelineSteps,
+    }));
+  }
+
+  // ════════════════════════════════════════════
+  // 頁面渲染 — Recording
+  // ════════════════════════════════════════════
+
+  let _recStatusInterval = null;
+
+  async function renderRecording() {
+    renderInto("page-recording", `
+      <div>
+        <h1 class="text-xl font-bold">音訊擷取</h1>
+        <p class="text-sm text-text-muted mt-0.5">麥克風與喇叭混音錄製</p>
+      </div>
+      <div id="panel-rec-control">${renderLoading()}</div>
+      <div id="panel-rec-list">${renderLoading()}</div>
+    `);
+
+    await Promise.all([
+      _refreshRecordingControl(),
+      _refreshRecordingList(),
+    ]);
+
+    // 每秒更新錄音計時器
+    clearInterval(_recStatusInterval);
+    _recStatusInterval = setInterval(_refreshRecordingControl, 1000);
+  }
+
+  async function _refreshRecordingControl() {
+    const status = await callApi("get_recording_status");
+    const isRecording = status?.recording ?? false;
+    const duration = status?.duration || "00:00";
+
+    const controlHtml = `
+      <div class="flex items-center gap-4 mb-5 flex-wrap">
+        <div class="flex items-center gap-2.5">
+          <div class="w-2.5 h-2.5 rounded-full ${isRecording ? "bg-status-error animate-pulse" : "bg-text-muted"}"></div>
+          <span class="text-sm font-semibold ${isRecording ? "text-status-error" : "text-text-muted"}">
+            ${isRecording ? "錄音中" : "待機"}
+          </span>
+          ${isRecording ? `<span class="text-sm text-text-muted font-mono">— ${esc(duration)}</span>` : ""}
+        </div>
+        ${isRecording ? renderStatusBadge({ status: "success", text: "VoiceMeeter 已連線" }) : ""}
+      </div>
+      <div class="flex gap-3 flex-wrap">
+        ${isRecording
+          ? `${renderButton({ variant:"danger",    icon:"square",   label:"停止錄音",  onclick:"stopRecording()" })}
+             ${renderButton({ variant:"secondary", icon:"scissors", label:"手動切割",  onclick:"splitRecording()" })}`
+          : renderButton({ variant:"primary", icon:"mic", label:"開始錄音", onclick:"startRecording()" })
+        }
+      </div>`;
+
+    renderInto("panel-rec-control", renderSectionPanel({
+      icon: "mic", iconColor: "text-accent-primary",
+      title: "錄音控制", description: "混合麥克風輸入與系統喇叭輸出",
+      children: controlHtml,
+    }));
+  }
+
+  async function _refreshRecordingList() {
+    const recordings = await callApi("list_recordings");
+    const rows = recordings?.length
+      ? recordings.map(r => _recordingRow(r, true)).join("")
+      : `<div class="py-8 text-center text-sm text-text-muted">尚無錄音檔案</div>`;
+
+    renderInto("panel-rec-list", renderSectionPanel({
+      icon: "list", iconColor: "text-text-muted",
+      title: "本地錄音檔案", description: `共 ${recordings?.length ?? 0} 筆`,
+      children: rows,
+      headerActions: renderButton({ variant:"secondary", icon:"refresh-cw", label:"重新整理", size:"sm", onclick:"_refreshRecordingList()" }),
+    }));
+  }
+
+  function _recordingRow(r, showDelete) {
+    const sm = { done:{s:"success",t:"完成"}, running:{s:"info",t:"處理中"}, error:{s:"error",t:"失敗"}, pending:{s:"warning",t:"等待"} }[r.status] || {s:"info",t:"處理中"};
+    const del = showDelete
+      ? renderButton({ variant:"ghost", icon:"trash-2", size:"sm", onclick:`deleteRecording('${r.id.replace(/'/g,"\\'")}')` })
+      : "";
+    return `<div class="flex items-center gap-3 py-3 border-b border-border-default last:border-b-0">
+      <div class="w-8 h-8 rounded-sm bg-bg-input flex items-center justify-center flex-shrink-0">
+        <i data-lucide="file-audio" class="w-4 h-4 text-text-muted"></i>
+      </div>
+      <div class="flex-1 min-w-0">
+        <div class="text-sm font-medium truncate">${esc(r.name)}</div>
+        <div class="text-xs text-text-muted mt-0.5">${esc(r.duration)} · ${esc(r.size)} · ${esc(r.time)}</div>
+      </div>
+      ${renderStatusBadge({ status: sm.s, text: sm.t })}
+      ${del}
+    </div>`;
+  }
+
+  // ════════════════════════════════════════════
+  // 頁面渲染 — Processing
+  // ════════════════════════════════════════════
+
+  async function renderProcessing() {
+    renderInto("page-processing", `
+      <div>
+        <h1 class="text-xl font-bold">AI 處理</h1>
+        <p class="text-sm text-text-muted mt-0.5">Whisper 轉譯 + Claude 摘要</p>
+      </div>
+      <div id="panel-proc">${renderLoading()}</div>
+    `);
+
+    const pipeline = await callApi("get_pipeline_status");
+    const stepsHtml = pipeline?.steps?.map(s => renderProgressItem(s)).join("")
+      || `<div class="py-8 text-center text-sm text-text-muted">目前沒有進行中的處理</div>`;
+
+    renderInto("panel-proc", renderSectionPanel({
+      icon: "cpu", iconColor: "text-accent-secondary",
+      title: "處理流程", description: pipeline?.recording_name || "—",
+      children: stepsHtml,
+      headerActions: renderButton({ variant:"secondary", icon:"refresh-cw", label:"重試", size:"sm", onclick:"retryProcessing()" }),
+    }));
+  }
+
+  // ════════════════════════════════════════════
+  // 頁面渲染 — Distribution
+  // ════════════════════════════════════════════
+
+  const DIST_TARGETS = [
+    { id:"google_calendar", icon:"calendar",      label:"Google 日曆",  desc:"自動建立會議行程與摘要內文",      color:"text-[#4285f4]" },
+    { id:"discord",         icon:"message-circle",label:"Discord",      desc:"#meeting-notes 頻道即時通知",     color:"text-[#5865f2]" },
+    { id:"slack",           icon:"hash",          label:"Slack",        desc:"#general 頻道（需設定 Token）",    color:"text-text-muted" },
+    { id:"obsidian",        icon:"book-open",     label:"Obsidian",     desc:"備份 Markdown 至 vault/meetings/", color:"text-[#7c3aed]" },
+    { id:"notion",          icon:"layout",        label:"Notion",       desc:"同步至 Notion Database（選填）",   color:"text-text-muted" },
+  ];
+
+  async function renderDistribution() {
+    renderInto("page-distribution", `
+      <div>
+        <h1 class="text-xl font-bold">自動分發</h1>
+        <p class="text-sm text-text-muted mt-0.5">摘要推送目標設定</p>
+      </div>
+      <div id="panel-dist">${renderLoading()}</div>
+    `);
+
+    const settings = await callApi("load_settings");
+    const dist = settings?.distribution || {};
+
+    const rows = DIST_TARGETS.map(t => {
+      const checked = dist[t.id] ?? false;
+      return `<label class="flex items-center gap-4 py-3.5 border-b border-border-default last:border-b-0 cursor-pointer">
+        <input type="checkbox" class="checkbox-custom" ${checked ? "checked" : ""}
+          onchange="onDistToggle(event, '${t.id}', '${t.label}')" />
+        <div class="w-8 h-8 rounded-sm bg-bg-input flex items-center justify-center flex-shrink-0">
+          <i data-lucide="${t.icon}" class="w-4 h-4 ${t.color}"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-medium">${esc(t.label)}</div>
+          <div class="text-xs text-text-muted mt-0.5">${esc(t.desc)}</div>
+        </div>
+        ${checked ? renderStatusBadge({status:"success",text:"啟用"}) : renderStatusBadge({status:"warning",text:"停用"})}
+      </label>`;
+    }).join("");
+
+    renderInto("panel-dist", renderSectionPanel({
+      icon: "send", iconColor: "text-accent-secondary",
+      title: "分發目標", description: "選擇摘要推送的目標平台",
+      children: rows,
+    }));
+  }
+
+  // ════════════════════════════════════════════
+  // 頁面渲染 — Settings
+  // ════════════════════════════════════════════
+
+  async function renderSettings() {
+    renderInto("page-settings", `
+      <div>
+        <h1 class="text-xl font-bold">設定</h1>
+        <p class="text-sm text-text-muted mt-0.5">API 金鑰與服務設定</p>
+      </div>
+      <div id="panel-set-api">${renderLoading()}</div>
+      <div id="panel-set-storage">${renderLoading()}</div>
+      <div id="panel-set-danger"></div>
+    `);
+
+    const settings = await callApi("load_settings");
+    const keys    = settings?.api_keys  || {};
+    const storage = settings?.storage   || {};
+
+    // API Keys
+    renderInto("panel-set-api", renderSectionPanel({
+      icon: "key", iconColor: "text-warn",
+      title: "API 金鑰", description: "Whisper 語音辨識與 Claude 摘要所需金鑰",
+      children: `<div class="flex flex-col gap-4">
+        ${renderInput({ id:"whisper-key", label:"OpenAI Whisper API Key", icon:"key", type:"password", placeholder:"sk-...", value: keys.whisper ? "••••••••" : "", required:true })}
+        ${renderInput({ id:"claude-key",  label:"Claude API Key",         icon:"key", type:"password", placeholder:"sk-ant-...", value: keys.claude ? "••••••••" : "", required:true })}
+        <div class="mt-1">${renderButton({ variant:"primary", icon:"save", label:"儲存 API 金鑰", onclick:"saveApiKeys()" })}</div>
+      </div>`,
+    }));
+
+    // Storage & Integration
+    renderInto("panel-set-storage", renderSectionPanel({
+      icon: "cloud", iconColor: "text-status-info",
+      title: "儲存與整合設定", description: "本地資料夾、雲端儲存、Webhook",
+      children: `<div class="flex flex-col gap-4">
+        ${renderInput({ id:"local-path",   label:"本地錄音資料夾",        icon:"folder", placeholder:"D:/AudioFlow/recordings/", value: storage.local_path || "" })}
+        ${renderInput({ id:"drive-folder", label:"Google Drive 資料夾 ID", icon:"cloud",  placeholder:"1BxiMVs0XRA5nFMdKvBd...", value: storage.drive_folder_id || "" })}
+        ${renderInput({ id:"webhook-url",  label:"Make Webhook URL",       icon:"link",   placeholder:"https://hook.make.com/...", value: storage.webhook_url || "" })}
+        <div class="mt-1 flex gap-3">
+          ${renderButton({ variant:"primary",   icon:"save", label:"儲存設定",  onclick:"saveStorage()" })}
+          ${renderButton({ variant:"secondary", icon:"plug", label:"測試連線",  onclick:"testConnection()" })}
+        </div>
+      </div>`,
+    }));
+
+    // Danger Zone
+    renderInto("panel-set-danger", renderSectionPanel({
+      icon: "triangle-alert", iconColor: "text-status-error",
+      title: "危險操作", description: "以下操作不可復原，請謹慎使用",
+      children: `
+        <div class="flex items-center justify-between py-2">
+          <div>
+            <div class="text-sm font-medium">清除所有錄音紀錄</div>
+            <div class="text-xs text-text-muted mt-0.5">刪除本地所有音訊檔案與處理紀錄</div>
+          </div>
+          ${renderButton({ variant:"danger", icon:"trash-2", label:"清除全部", onclick:"clearAllRecordings()" })}
+        </div>`,
+    }));
+  }
+
+  // ════════════════════════════════════════════
+  // 事件處理
+  // ════════════════════════════════════════════
+
+  async function startRecording() {
+    const result = await callApi("start_recording");
+    if (result) {
+      showToast(`開始錄音：${result.filename}`, "success");
+      _refreshRecordingControl();
+    } else {
+      showToast("無法開始錄音，請確認音訊裝置", "error");
+    }
+  }
+
+  async function stopRecording() {
+    showConfirmModal({
+      icon:"square", iconBg:"background:#ff5c5c15", iconColor:"text-accent-primary",
+      title:"停止錄音", message:"停止後將自動切割並上傳至 Google Drive 進行 AI 處理。",
+      confirmLabel:"停止並上傳", confirmVariant:"primary",
+      onConfirm: async () => {
+        const result = await callApi("stop_recording");
+        if (result) {
+          showToast(`錄音完成：${result.filename}（${result.duration}）`, "success");
+          _refreshRecordingControl();
+          _refreshRecordingList();
+        } else {
+          showToast("停止錄音失敗", "error");
+        }
+      },
+    });
+  }
+
+  async function splitRecording() {
+    const result = await callApi("split_recording");
+    if (result) {
+      showToast(`已切割，繼續錄製新段：${result.filename}`, "success");
+      _refreshRecordingControl();
+    } else {
+      showToast("切割失敗", "error");
+    }
+  }
+
+  async function deleteRecording(id) {
+    showConfirmModal({
+      icon:"trash-2", iconBg:"background:#ef444415", iconColor:"text-status-error",
+      title:"刪除錄音", message:`確定要刪除「${id}」？此操作無法復原。`,
+      confirmLabel:"確認刪除", confirmVariant:"danger",
+      onConfirm: async () => {
+        const result = await callApi("delete_recording", id);
+        if (result !== null) {
+          showToast("錄音已刪除", "success");
+          _refreshRecordingList();
+        } else {
+          showToast("刪除失敗", "error");
+        }
+      },
+    });
+  }
+
+  async function retryProcessing() {
+    showToast("重新觸發處理流程...", "info");
+    await renderProcessing();
+  }
+
+  async function onDistToggle(event, targetId, label) {
+    const enabled = event.target.checked;
+    const result = await callApi("save_distribution_targets", { [targetId]: enabled });
+    if (result !== null) {
+      showToast(`${label} 已${enabled ? "啟用" : "停用"}`, enabled ? "success" : "warning");
+    } else {
+      showToast("設定儲存失敗", "error");
+      event.target.checked = !enabled; // revert
+    }
+  }
+
+  async function saveApiKeys() {
+    const w = document.getElementById("whisper-key")?.value?.trim();
+    const c = document.getElementById("claude-key")?.value?.trim();
+    if (!w || w === "••••••••" || !c || c === "••••••••") {
+      showToast("請填入真實的 API 金鑰", "warning"); return;
+    }
+    const result = await callApi("save_api_keys", w, c);
+    result !== null ? showToast("API 金鑰已儲存", "success") : showToast("儲存失敗", "error");
+  }
+
+  async function saveStorage() {
+    const local    = document.getElementById("local-path")?.value?.trim()   || "";
+    const driveId  = document.getElementById("drive-folder")?.value?.trim() || "";
+    const webhook  = document.getElementById("webhook-url")?.value?.trim()  || "";
+    const result = await callApi("save_storage_settings", local, driveId, webhook);
+    result !== null ? showToast("儲存設定已更新", "success") : showToast("儲存失敗", "error");
+  }
+
+  async function testConnection() {
+    showToast("連線測試中...", "info");
+    const result = await callApi("test_connection");
+    result ? showToast(result.message || "連線成功", "success") : showToast("連線失敗，請確認 Webhook URL", "error");
+  }
+
+  function clearAllRecordings() {
+    showConfirmModal({
+      icon:"trash-2", iconBg:"background:#ef444415", iconColor:"text-status-error",
+      title:"清除所有錄音紀錄",
+      message:"將刪除本地所有音訊檔案。此操作無法復原。",
+      notice:"雲端 Google Drive 的備份不受影響。",
+      confirmLabel:"確認清除", confirmVariant:"danger",
+      onConfirm: () => showToast("此功能尚未實作", "warning"),
+    });
+  }
+
+  // ════════════════════════════════════════════
+  // 初始化（openclaw/bootstrap.js）
+  // ════════════════════════════════════════════
+
+  async function initApp() {
+    document.getElementById("loading-text").textContent = "確認後端服務中...";
+
+    const pong = await callApi("ping");
+    if (!pong) {
+      document.getElementById("loading-text").textContent = "無法連接後端服務";
+      return;
+    }
+
+    // 取得版本號
+    const version = await callApi("get_app_version");
+    if (version) document.getElementById("app-version").textContent = `v${version}`;
+
+    // 顯示主介面
+    document.getElementById("app-loading").classList.add("hidden");
+    document.getElementById("app-main").classList.remove("hidden");
+    document.getElementById("app-main").classList.add("flex");
+
+    // 更新服務狀態指示器
+    document.getElementById("service-status").innerHTML = `
+      <div class="w-2 h-2 rounded-full bg-status-success animate-pulse"></div>
+      <span class="text-xs text-text-muted">服務運行中</span>`;
+
+    refreshIcons();
+    renderDashboard();
+  }
+
+  // PyWebView 就緒後啟動
+  window.addEventListener("pywebviewready", initApp);
+
+  // 開發模式（在瀏覽器中預覽）：直接初始化
+  document.addEventListener("DOMContentLoaded", () => {
+    refreshIcons();
+    if (!window.pywebview) {
+      // 沒有 PyWebView 環境（瀏覽器預覽），顯示提示
+      setTimeout(() => {
+        document.getElementById("loading-text").textContent = "請以桌面應用模式啟動（python -m src.main）";
+      }, 500);
+    }
+  });
+  </script>
+</body>
+</html>

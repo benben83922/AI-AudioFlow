@@ -1,0 +1,755 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI AudioFlow</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          colors: {
+            "bg-primary":       "#0e1015",
+            "bg-accent":        "#13151b",
+            "bg-card":          "#161920",
+            "bg-elevated":      "#191c24",
+            "bg-input":         "#1e2028",
+            "bg-hover":         "#1f2330",
+            "border-default":   "#1e2028",
+            "border-strong":    "#2e3040",
+            "text-primary":     "#f4f4f5",
+            "text-secondary":   "#d4d4d8",
+            "text-muted":       "#838387",
+            "accent-primary":   "#ff5c5c",
+            "accent-secondary": "#14b8a6",
+            "accent-subtle":    "#ff5c5c1a",
+            "accent-glow":      "#ff5c5c33",
+            "status-success":   "#22c55e",
+            "status-error":     "#ef4444",
+            "status-info":      "#3b82f6",
+            "warn":             "#f59e0b",
+            "text-on-accent":   "#ffffff",
+          },
+          fontFamily: { sans: ["Inter", "sans-serif"] },
+          borderRadius: { sm: "6px", md: "10px", lg: "14px", xl: "20px" },
+        },
+      },
+    };
+  </script>
+
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+
+    body {
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+      -webkit-user-select: none;
+    }
+    input, textarea { user-select: text; -webkit-user-select: text; }
+
+    /* ── Nav Item ── */
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 0 12px; height: 40px; border-radius: 12px;
+      font-size: 14px; font-weight: 500; color: #d4d4d8;
+      cursor: pointer; border: 1px solid transparent;
+      transition: background-color 150ms ease, color 150ms ease, border-color 150ms ease;
+      user-select: none;
+    }
+    .nav-item:hover { background-color: #161920; }
+    .nav-item-active, .nav-item-active:hover {
+      background-color: #ff5c5c1a; border-color: #ff5c5c33;
+      color: #f4f4f5; font-weight: 600;
+    }
+    .nav-icon { width: 18px; height: 18px; flex-shrink: 0; color: #838387; transition: color 150ms ease; }
+    .nav-item:hover .nav-icon { color: #d4d4d8; }
+    .nav-item-active .nav-icon { color: #ff5c5c; }
+
+    /* ── Checkbox ── */
+    .checkbox-custom {
+      appearance: none; -webkit-appearance: none;
+      width: 16px; height: 16px; border: 1.5px solid #1e2028;
+      border-radius: 3px; background: transparent; cursor: pointer;
+      flex-shrink: 0; position: relative;
+      transition: background-color 150ms ease, border-color 150ms ease;
+    }
+    .checkbox-custom:checked { background-color: #ff5c5c; border-color: #ff5c5c; }
+    .checkbox-custom:checked::after {
+      content: ""; position: absolute;
+      top: 1px; left: 4px; width: 5px; height: 9px;
+      border: solid white; border-width: 0 2px 2px 0;
+      transform: rotate(45deg);
+    }
+    .checkbox-custom:hover { border-color: #838387; }
+
+    /* ── Collapsible ── */
+    .collapsible-content { max-height: 0; overflow: hidden; transition: max-height 250ms ease; }
+    .collapsible-content.expanded { max-height: 600px; }
+    .collapsible-chevron { transition: transform 200ms ease; }
+    .collapsible-chevron.rotated { transform: rotate(90deg); }
+
+    /* ── Animations ── */
+    @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+    .animate-spin { animation: spin 1s linear infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .animate-pulse { animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite; }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #2a2d35; border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: #3a3d45; }
+
+    /* ── Pages ── */
+    .page { display: none; }
+    .page.active { display: flex; flex-direction: column; gap: 1.5rem; }
+  </style>
+</head>
+<body class="bg-bg-primary font-sans text-text-primary m-0 h-screen overflow-hidden flex">
+
+  <!-- ═══════════════════════════════════════
+       SIDEBAR
+  ═══════════════════════════════════════ -->
+  <aside class="w-56 h-screen bg-bg-accent flex flex-col flex-shrink-0 border-r border-border-default">
+
+    <!-- Logo -->
+    <div class="px-4 py-5 flex items-center gap-3 border-b border-border-default">
+      <div class="w-9 h-9 rounded-md bg-accent-primary flex items-center justify-center flex-shrink-0">
+        <i data-lucide="audio-waveform" class="w-5 h-5 text-white"></i>
+      </div>
+      <div>
+        <div class="text-sm font-bold">AI AudioFlow</div>
+        <div class="text-[11px] text-text-muted">自動錄音摘要系統</div>
+      </div>
+    </div>
+
+    <!-- Nav -->
+    <nav class="flex-1 p-3 flex flex-col gap-1 overflow-y-auto">
+      <div class="nav-item nav-item-active" onclick="navigateTo('dashboard')">
+        <i data-lucide="layout-dashboard" class="nav-icon"></i>
+        <span>儀表板</span>
+      </div>
+      <div class="nav-item" onclick="navigateTo('recording')">
+        <i data-lucide="mic" class="nav-icon"></i>
+        <span>音訊擷取</span>
+      </div>
+      <div class="nav-item" onclick="navigateTo('processing')">
+        <i data-lucide="cpu" class="nav-icon"></i>
+        <span>AI 處理</span>
+      </div>
+      <div class="nav-item" onclick="navigateTo('distribution')">
+        <i data-lucide="send" class="nav-icon"></i>
+        <span>自動分發</span>
+      </div>
+
+      <div class="mt-auto pt-2 border-t border-border-default">
+        <div class="nav-item" onclick="navigateTo('settings')">
+          <i data-lucide="settings" class="nav-icon"></i>
+          <span>設定</span>
+        </div>
+      </div>
+    </nav>
+
+    <!-- Service status -->
+    <div class="px-4 py-3 border-t border-border-default">
+      <div class="flex items-center gap-2">
+        <div class="w-2 h-2 rounded-full bg-status-success animate-pulse"></div>
+        <span class="text-xs text-text-muted">服務運行中</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- ═══════════════════════════════════════
+       MAIN CONTENT
+  ═══════════════════════════════════════ -->
+  <main class="flex-1 h-screen overflow-y-auto bg-bg-primary">
+    <div class="p-6 flex flex-col gap-6 max-w-5xl">
+
+      <!-- Dashboard -->
+      <div id="page-dashboard" class="page active">
+        <div>
+          <h1 class="text-xl font-bold">儀表板</h1>
+          <p class="text-sm text-text-muted mt-0.5">系統狀態總覽</p>
+        </div>
+        <div id="stat-cards" class="flex gap-4"></div>
+        <div id="panel-recent"></div>
+        <div id="panel-pipeline"></div>
+      </div>
+
+      <!-- Recording -->
+      <div id="page-recording" class="page">
+        <div>
+          <h1 class="text-xl font-bold">音訊擷取</h1>
+          <p class="text-sm text-text-muted mt-0.5">麥克風與喇叭混音錄製</p>
+        </div>
+        <div id="panel-recording-control"></div>
+        <div id="panel-recording-list"></div>
+      </div>
+
+      <!-- Processing -->
+      <div id="page-processing" class="page">
+        <div>
+          <h1 class="text-xl font-bold">AI 處理</h1>
+          <p class="text-sm text-text-muted mt-0.5">Whisper 轉譯 + Claude 摘要</p>
+        </div>
+        <div id="panel-processing"></div>
+      </div>
+
+      <!-- Distribution -->
+      <div id="page-distribution" class="page">
+        <div>
+          <h1 class="text-xl font-bold">自動分發</h1>
+          <p class="text-sm text-text-muted mt-0.5">摘要推送目標設定</p>
+        </div>
+        <div id="panel-distribution"></div>
+      </div>
+
+      <!-- Settings -->
+      <div id="page-settings" class="page">
+        <div>
+          <h1 class="text-xl font-bold">設定</h1>
+          <p class="text-sm text-text-muted mt-0.5">API 金鑰與服務設定</p>
+        </div>
+        <div id="panel-settings-api"></div>
+        <div id="panel-settings-storage"></div>
+        <div id="panel-settings-danger"></div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- ═══════════════════════════════════════
+       JAVASCRIPT — 元件 + 邏輯
+  ═══════════════════════════════════════ -->
+  <script>
+
+  // ────────────────────────────────────────
+  // 工具函式（ported from core.js）
+  // ────────────────────────────────────────
+
+  function esc(str) {
+    if (str == null) return "";
+    return String(str)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+
+  function refreshIcons() {
+    lucide.createIcons({ nameAttr: "data-lucide" });
+  }
+
+  function renderInto(id, html) {
+    const el = document.getElementById(id);
+    if (el) { el.innerHTML = html; refreshIcons(); }
+  }
+
+  // Toast（ported from core.js:78）
+  function showToast(message, type = "success", duration = 4000) {
+    const colors = {
+      success: "bg-status-success text-white",
+      warning: "bg-warn text-white",
+      error:   "bg-status-error text-white",
+      info:    "bg-status-info text-white",
+    };
+    const icons = { success: "check-circle", warning: "alert-triangle", error: "x-circle", info: "info" };
+    let container = document.getElementById("toast-container");
+    if (!container) {
+      container = document.createElement("div");
+      container.id = "toast-container";
+      container.className = "fixed top-4 right-4 z-[9999] flex flex-col gap-2";
+      document.body.appendChild(container);
+    }
+    const toast = document.createElement("div");
+    toast.className = `flex items-center gap-2 px-4 py-3 rounded-md shadow-lg text-sm font-medium ${colors[type] || colors.success} transition-opacity duration-300`;
+    toast.innerHTML = `<i data-lucide="${icons[type] || "info"}" class="w-4 h-4"></i><span>${esc(message)}</span>`;
+    container.appendChild(toast);
+    refreshIcons();
+    setTimeout(() => { toast.classList.add("opacity-0"); setTimeout(() => toast.remove(), 300); }, duration);
+  }
+
+  // ────────────────────────────────────────
+  // Confirm Modal（ported from components.js:210）
+  // ────────────────────────────────────────
+
+  let _confirmCallbacks = null;
+
+  function showConfirmModal({ icon = "triangle-alert", iconBg = "background:#ef444415", iconColor = "text-status-error", title, message, notice, confirmLabel, confirmVariant = "danger", onConfirm, onCancel }) {
+    _confirmCallbacks = { onConfirm, onCancel };
+    const btnColor = confirmVariant === "danger"
+      ? "bg-status-error text-white hover:bg-[#dc2626]"
+      : "bg-accent-primary text-white hover:bg-[#e64d4d]";
+    const noticeHtml = notice
+      ? `<div class="w-full rounded-sm flex items-start gap-2.5 text-left" style="background:#f59e0b1a;border-left:3px solid #f59e0b;padding:10px 12px">
+           <i data-lucide="alert-triangle" class="w-4 h-4 text-warn flex-shrink-0 mt-0.5"></i>
+           <div class="text-[12px] text-text-secondary leading-snug">${esc(notice)}</div>
+         </div>` : "";
+    const overlay = document.createElement("div");
+    overlay.id = "confirm-modal-overlay";
+    overlay.className = "fixed inset-0 z-[9000] flex items-center justify-center bg-black/60 backdrop-blur-sm";
+    overlay.innerHTML = `
+      <div class="bg-bg-card border border-border-strong rounded-md w-[420px] flex flex-col items-center gap-5" style="padding:32px">
+        <div class="w-14 h-14 rounded-full flex items-center justify-center" style="${iconBg}">
+          <i data-lucide="${esc(icon)}" class="w-8 h-8 ${iconColor}"></i>
+        </div>
+        <div class="text-lg font-bold text-text-primary text-center">${esc(title)}</div>
+        ${message ? `<div class="text-[13px] text-text-secondary text-center leading-relaxed" style="max-width:340px">${esc(message)}</div>` : ""}
+        ${noticeHtml}
+        <div class="flex gap-3 w-full mt-1">
+          <button onclick="_confirmModalCancel()"
+            class="flex-1 inline-flex items-center justify-center gap-2 font-medium rounded-sm px-4 py-2.5 text-sm bg-bg-card text-text-secondary border border-border-default hover:bg-bg-input transition-colors cursor-pointer">
+            取消
+          </button>
+          <button onclick="_confirmModalOk()"
+            class="flex-1 inline-flex items-center justify-center gap-2 font-medium rounded-sm px-4 py-2.5 text-sm ${btnColor} transition-colors cursor-pointer">
+            <i data-lucide="${esc(icon)}" class="w-4 h-4"></i>
+            <span>${esc(confirmLabel)}</span>
+          </button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    refreshIcons();
+  }
+
+  function _confirmModalOk()    { const cb = _confirmCallbacks?.onConfirm; _closeConfirmModal(); if (cb) cb(); }
+  function _confirmModalCancel(){ const cb = _confirmCallbacks?.onCancel;  _closeConfirmModal(); if (cb) cb(); }
+  function _closeConfirmModal() { _confirmCallbacks = null; document.getElementById("confirm-modal-overlay")?.remove(); }
+
+  // ────────────────────────────────────────
+  // UI 元件（ported from components.js）
+  // ────────────────────────────────────────
+
+  // Button（components.js:10）
+  function renderButton({ variant = "primary", icon, label = "", disabled = false, loading = false, id, onclick, size = "md" }) {
+    const base = "inline-flex items-center justify-center gap-2 font-medium rounded-sm transition-colors cursor-pointer select-none";
+    const sizing = size === "sm" ? "px-3 py-1.5 text-xs" : "px-4 py-2.5 text-sm";
+    const variants = {
+      primary:   "bg-accent-primary text-white hover:bg-[#e64d4d]",
+      secondary: "bg-bg-card text-text-secondary border border-border-default hover:bg-bg-input",
+      danger:    "bg-status-error text-white hover:bg-[#dc2626]",
+      warning:   "bg-warn text-white hover:bg-[#d97706]",
+      ghost:     "bg-transparent text-text-muted hover:text-text-secondary hover:bg-bg-input",
+    };
+    const dis = disabled || loading ? "opacity-50 pointer-events-none" : "";
+    const iconName = loading ? "loader" : icon;
+    const iconCls  = loading ? "animate-spin" : "";
+    return `<button ${id ? `id="${id}"` : ""} class="${base} ${sizing} ${variants[variant] || variants.primary} ${dis}" ${disabled ? "disabled" : ""} ${onclick && !disabled ? `onclick="${onclick}"` : ""}>
+      ${iconName ? `<i data-lucide="${iconName}" class="w-4 h-4 ${iconCls}"></i>` : ""}
+      ${label ? `<span>${label}</span>` : ""}
+    </button>`;
+  }
+
+  // Input（components.js:63）
+  function renderInput({ id, label, icon, placeholder = "", type = "text", value = "", error, required = false }) {
+    const border = error ? "border-status-error" : "border-border-default focus-within:border-accent-primary";
+    const req = required ? '<span class="text-accent-primary ml-0.5">*</span>' : "";
+    const pwToggle = type === "password"
+      ? `<button type="button" class="pwd-toggle absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-secondary" onclick="togglePassword('${id}')"><i data-lucide="eye-off" class="w-4 h-4"></i></button>`
+      : "";
+    return `<div class="flex flex-col gap-1.5">
+      ${label ? `<label for="${id}" class="text-xs font-medium text-text-secondary">${label}${req}</label>` : ""}
+      <div class="relative">
+        ${icon ? `<i data-lucide="${icon}" class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-text-muted"></i>` : ""}
+        <input id="${id}" name="${id}" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}"
+          class="w-full bg-bg-input border ${border} rounded-sm text-sm text-text-primary placeholder:text-text-muted ${icon ? "pl-10" : "pl-3"} ${type === "password" ? "pr-10" : "pr-3"} py-2.5 outline-none transition-colors" />
+        ${pwToggle}
+      </div>
+      ${error ? `<span class="text-xs text-status-error">${error}</span>` : ""}
+    </div>`;
+  }
+
+  function togglePassword(inputId) {
+    const input = document.getElementById(inputId);
+    if (!input) return;
+    const isPassword = input.type === "password";
+    input.type = isPassword ? "text" : "password";
+    const btn = input.parentElement.querySelector(".pwd-toggle i");
+    if (btn) btn.setAttribute("data-lucide", isPassword ? "eye" : "eye-off");
+    refreshIcons();
+  }
+
+  // Status Badge（components.js:96）
+  function renderStatusBadge({ status, text }) {
+    const colors = {
+      success: { dot: "bg-status-success", bg: "bg-[#22c55e18]", txt: "text-status-success" },
+      error:   { dot: "bg-status-error",   bg: "bg-[#ef444418]", txt: "text-status-error" },
+      warning: { dot: "bg-[#eab308]",      bg: "bg-[#eab30818]", txt: "text-[#eab308]" },
+      info:    { dot: "bg-status-info",     bg: "bg-[#3b82f618]", txt: "text-status-info" },
+    };
+    const c = colors[status] || colors.info;
+    return `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full ${c.bg} ${c.txt} text-xs font-medium whitespace-nowrap">
+      <span class="w-1.5 h-1.5 rounded-full ${c.dot}"></span>${esc(text)}
+    </span>`;
+  }
+
+  // Stat Card（components.js:113）
+  function renderStatCard({ icon, iconColor = "text-accent-primary", value, label, status }) {
+    const badge = status ? renderStatusBadge({ status, text: status === "success" ? "正常" : status }) : "";
+    return `<div class="bg-bg-card border border-border-default rounded-md p-5 flex-1 min-w-0">
+      <div class="flex items-center justify-between mb-3">
+        <div class="w-9 h-9 rounded-sm bg-bg-input flex items-center justify-center">
+          <i data-lucide="${icon}" class="w-[18px] h-[18px] ${iconColor}"></i>
+        </div>
+        ${badge}
+      </div>
+      <div class="text-2xl font-bold">${esc(value)}</div>
+      <div class="text-xs text-text-muted mt-1">${esc(label)}</div>
+    </div>`;
+  }
+
+  // Section Panel（components.js:149）
+  function renderSectionPanel({ icon, iconColor = "text-accent-primary", title, description, children = "", id, headerActions = "" }) {
+    const idAttr = id ? `id="${id}"` : "";
+    const titleFlex = headerActions ? " flex-1" : "";
+    return `<div ${idAttr} class="bg-bg-card border border-border-default rounded-md">
+      <div class="px-5 pt-5 pb-4 flex items-center gap-3 flex-shrink-0">
+        <div class="w-9 h-9 rounded-sm bg-bg-input flex items-center justify-center flex-shrink-0">
+          <i data-lucide="${icon}" class="w-[18px] h-[18px] ${iconColor}"></i>
+        </div>
+        <div class="${titleFlex}">
+          <h3 class="text-base font-semibold">${esc(title)}</h3>
+          ${description ? `<p class="text-[13px] text-text-secondary mt-0.5">${esc(description)}</p>` : ""}
+        </div>
+        ${headerActions}
+      </div>
+      <div class="px-5 pb-5">${children}</div>
+    </div>`;
+  }
+
+  // Progress Item（components.js:354）
+  function renderProgressItem({ name, description, status, error }) {
+    const cfg = {
+      done:    { circleClass: "bg-status-success", icon: "check",  iconClass: "text-white", textClass: "text-status-success", label: "完成" },
+      running: { circleClass: "bg-accent-primary", icon: "loader", iconClass: "text-white animate-spin", textClass: "text-accent-primary", label: "處理中" },
+      pending: { circleClass: "border-2 border-border-default bg-transparent", icon: null, iconClass: "", textClass: "text-text-muted", label: "等待中" },
+      failed:  { circleClass: "bg-status-error",   icon: "x",      iconClass: "text-white", textClass: "text-status-error", label: "失敗" },
+    };
+    const c = cfg[status] || cfg.pending;
+    const circleContent = c.icon ? `<i data-lucide="${c.icon}" class="w-3.5 h-3.5 ${c.iconClass}"></i>` : "";
+    const errorBlock = (status === "failed" && error)
+      ? `<div class="bg-red-500/10 rounded-lg p-3 mt-2">
+           <div class="flex items-center gap-1.5 mb-1">
+             <i data-lucide="triangle-alert" class="w-3.5 h-3.5 text-status-error"></i>
+             <span class="text-xs font-semibold text-status-error">錯誤詳情</span>
+           </div>
+           <pre class="text-xs text-red-400 font-mono whitespace-pre-wrap">${esc(error)}</pre>
+         </div>` : "";
+    return `<div class="py-3 border-b border-border-default last:border-b-0">
+      <div class="flex items-center gap-3">
+        <div class="w-7 h-7 rounded-full ${c.circleClass} flex items-center justify-center flex-shrink-0">${circleContent}</div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-medium">${esc(name)}</div>
+          ${description ? `<div class="text-xs text-text-secondary mt-0.5">${esc(description)}</div>` : ""}
+        </div>
+        <span class="text-xs font-medium ${c.textClass}">${c.label}</span>
+      </div>${errorBlock}
+    </div>`;
+  }
+
+  // Loading（core.js:197）
+  function renderLoading(msg = "載入中...") {
+    return `<div class="flex items-center gap-3 text-text-muted py-8">
+      <i data-lucide="loader" class="w-5 h-5 animate-spin"></i>
+      <span class="text-sm">${esc(msg)}</span>
+    </div>`;
+  }
+
+  // ────────────────────────────────────────
+  // 路由
+  // ────────────────────────────────────────
+
+  function navigateTo(view) {
+    document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
+    document.getElementById(`page-${view}`)?.classList.add("active");
+    document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("nav-item-active"));
+    document.querySelector(`.nav-item[onclick="navigateTo('${view}')"]`)?.classList.add("nav-item-active");
+    renderPage(view);
+  }
+
+  function renderPage(v) {
+    ({ dashboard: renderDashboard, recording: renderRecording, processing: renderProcessing, distribution: renderDistribution, settings: renderSettings }[v] || (() => {}))();
+  }
+
+  // ────────────────────────────────────────
+  // Demo 資料
+  // ────────────────────────────────────────
+
+  const recordings = [
+    { id: 1, name: "會議錄音_2026-06-04_09:30.mp3", duration: "23:14", size: "12.4 MB", status: "done",    time: "今天 09:54" },
+    { id: 2, name: "通話錄音_2026-06-04_11:00.mp3",  duration: "08:45", size: "4.8 MB",  status: "running", time: "今天 11:09" },
+    { id: 3, name: "會議錄音_2026-06-03_14:00.mp3",  duration: "45:22", size: "24.1 MB", status: "done",    time: "昨天 14:46" },
+    { id: 4, name: "通話錄音_2026-06-03_10:15.mp3",  duration: "12:33", size: "6.7 MB",  status: "error",   time: "昨天 10:28" },
+  ];
+
+  const pipelineSteps = [
+    { name: "上傳至 Google Drive",  description: "meeting_0604_0930.mp3 → cloud/audio/2026-06-04/", status: "done" },
+    { name: "Webhook 觸發 Make",    description: "自動化平台收到上傳事件，開始排程", status: "done" },
+    { name: "Whisper 語音轉文字",   description: "OpenAI Whisper API — 轉譯完成，共 3,847 字", status: "done" },
+    { name: "Claude 結構化摘要",    description: "Claude API — 生成 Markdown 格式摘要中...", status: "running" },
+    { name: "Google 日曆建立行程",  description: "摘要完成後自動建立會議記錄", status: "pending" },
+    { name: "Discord / Obsidian 分發", description: "#meeting-notes 通知 + vault/meetings/2026-06-04.md", status: "pending" },
+  ];
+
+  const statusMap = { done: { s: "success", t: "完成" }, running: { s: "info", t: "處理中" }, error: { s: "error", t: "失敗" }, pending: { s: "warning", t: "等待" } };
+
+  // ────────────────────────────────────────
+  // 頁面渲染
+  // ────────────────────────────────────────
+
+  function renderDashboard() {
+    // Stat Cards
+    renderInto("stat-cards", [
+      renderStatCard({ icon: "mic",       value: "3",  label: "今日錄音次數",  iconColor: "text-accent-primary" }),
+      renderStatCard({ icon: "file-text", value: "8",  label: "已完成轉譯",   iconColor: "text-accent-secondary", status: "success" }),
+      renderStatCard({ icon: "send",      value: "21", label: "已分發筆記",   iconColor: "text-status-info" }),
+    ].join(""));
+
+    // Recent Recordings
+    const recentRows = recordings.map(r => {
+      const sm = statusMap[r.status];
+      return `<div class="flex items-center gap-3 py-3 border-b border-border-default last:border-b-0">
+        <div class="w-8 h-8 rounded-sm bg-bg-input flex items-center justify-center flex-shrink-0">
+          <i data-lucide="file-audio" class="w-4 h-4 text-text-muted"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-medium truncate">${esc(r.name)}</div>
+          <div class="text-xs text-text-muted mt-0.5">${esc(r.duration)} · ${esc(r.size)} · ${esc(r.time)}</div>
+        </div>
+        ${renderStatusBadge({ status: sm.s, text: sm.t })}
+        ${r.status === "error" ? renderButton({ variant: "ghost", icon: "trash-2", size: "sm", onclick: `deleteRecording(${r.id})` }) : ""}
+      </div>`;
+    }).join("");
+
+    renderInto("panel-recent", renderSectionPanel({
+      icon: "clock", iconColor: "text-text-muted",
+      title: "近期錄音", description: "最近 4 筆錄音紀錄",
+      children: recentRows,
+    }));
+
+    // Pipeline
+    renderInto("panel-pipeline", renderSectionPanel({
+      icon: "cpu", iconColor: "text-accent-secondary",
+      title: "當前處理進度", description: "會議錄音_2026-06-04_09:30.mp3",
+      children: pipelineSteps.map(s => renderProgressItem(s)).join(""),
+    }));
+  }
+
+  function renderRecording() {
+    renderInto("panel-recording-control", renderSectionPanel({
+      icon: "mic", iconColor: "text-accent-primary",
+      title: "錄音控制", description: "混合麥克風輸入與系統喇叭輸出",
+      children: `
+        <div class="flex items-center gap-4 mb-5 flex-wrap">
+          <div class="flex items-center gap-2.5">
+            <div class="w-2.5 h-2.5 rounded-full bg-status-error animate-pulse"></div>
+            <span class="text-sm font-semibold text-status-error">錄音中</span>
+            <span class="text-sm text-text-muted">— 00:08:45</span>
+          </div>
+          ${renderStatusBadge({ status: "success", text: "VoiceMeeter 已連線" })}
+          ${renderStatusBadge({ status: "info", text: "48kHz / MP3" })}
+        </div>
+        <div class="flex gap-3 flex-wrap">
+          ${renderButton({ variant: "danger",    icon: "square",   label: "停止錄音",  onclick: "stopRecording()" })}
+          ${renderButton({ variant: "secondary", icon: "scissors", label: "手動切割",  onclick: "splitRecording()" })}
+          ${renderButton({ variant: "ghost",     icon: "pause",    label: "暫停",      onclick: "showToast('暫停錄音', 'warning')" })}
+        </div>`,
+    }));
+
+    const listRows = recordings.map(r => {
+      const sm = statusMap[r.status];
+      return `<div class="flex items-center gap-3 py-3 border-b border-border-default last:border-b-0">
+        <div class="w-8 h-8 rounded-sm bg-bg-input flex items-center justify-center flex-shrink-0">
+          <i data-lucide="file-audio" class="w-4 h-4 text-text-muted"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-medium truncate">${esc(r.name)}</div>
+          <div class="text-xs text-text-muted mt-0.5">${esc(r.duration)} · ${esc(r.size)}</div>
+        </div>
+        ${renderStatusBadge({ status: sm.s, text: sm.t })}
+        ${renderButton({ variant: "ghost", icon: "trash-2", size: "sm", onclick: `deleteRecording(${r.id})` })}
+      </div>`;
+    }).join("");
+
+    renderInto("panel-recording-list", renderSectionPanel({
+      icon: "list", iconColor: "text-text-muted",
+      title: "本地錄音檔案", description: `共 ${recordings.length} 筆，儲存於 D:/AudioFlow/recordings/`,
+      children: listRows,
+      headerActions: renderButton({ variant: "secondary", icon: "folder-open", label: "開啟資料夾", size: "sm", onclick: "showToast('開啟資料夾', 'info')" }),
+    }));
+  }
+
+  function renderProcessing() {
+    renderInto("panel-processing", renderSectionPanel({
+      icon: "cpu", iconColor: "text-accent-secondary",
+      title: "處理流程", description: "會議錄音_2026-06-04_09:30.mp3 — 第 4/6 步",
+      children: pipelineSteps.map(s => renderProgressItem(s)).join(""),
+      headerActions: renderButton({ variant: "secondary", icon: "refresh-cw", label: "重試", size: "sm", onclick: "retryProcessing()" }),
+    }));
+  }
+
+  function renderDistribution() {
+    const targets = [
+      { id: "cal",      icon: "calendar",     label: "Google 日曆",      desc: "自動建立會議行程與摘要內文",        checked: true,  color: "text-[#4285f4]" },
+      { id: "discord",  icon: "message-circle",label: "Discord",          desc: "#meeting-notes 頻道即時通知",       checked: true,  color: "text-[#5865f2]" },
+      { id: "slack",    icon: "hash",          label: "Slack",            desc: "#general 頻道（尚未設定）",          checked: false, color: "text-text-muted" },
+      { id: "obsidian", icon: "book-open",     label: "Obsidian",         desc: "備份 Markdown 至 vault/meetings/",  checked: true,  color: "text-[#7c3aed]" },
+      { id: "notion",   icon: "layout",        label: "Notion",           desc: "同步至 Notion Database（選填）",    checked: false, color: "text-text-muted" },
+    ];
+
+    const rows = targets.map(t => `
+      <label class="flex items-center gap-4 py-3.5 border-b border-border-default last:border-b-0 cursor-pointer">
+        <input type="checkbox" class="checkbox-custom" ${t.checked ? "checked" : ""} onchange="onDistributionToggle(event, '${t.label}')" />
+        <div class="w-8 h-8 rounded-sm bg-bg-input flex items-center justify-center flex-shrink-0">
+          <i data-lucide="${t.icon}" class="w-4 h-4 ${t.color}"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="text-sm font-medium">${esc(t.label)}</div>
+          <div class="text-xs text-text-muted mt-0.5">${esc(t.desc)}</div>
+        </div>
+        ${t.checked ? renderStatusBadge({ status: "success", text: "啟用" }) : renderStatusBadge({ status: "warning", text: "停用" })}
+      </label>`).join("");
+
+    renderInto("panel-distribution", renderSectionPanel({
+      icon: "send", iconColor: "text-accent-secondary",
+      title: "分發目標", description: "選擇摘要推送的目標平台",
+      children: rows,
+    }));
+  }
+
+  function renderSettings() {
+    // API Keys
+    renderInto("panel-settings-api", renderSectionPanel({
+      icon: "key", iconColor: "text-warn",
+      title: "API 金鑰", description: "Whisper 語音辨識與 Claude 摘要所需金鑰",
+      children: `<div class="flex flex-col gap-4">
+        ${renderInput({ id: "whisper-key", label: "OpenAI Whisper API Key", icon: "key", type: "password", placeholder: "sk-...", required: true })}
+        ${renderInput({ id: "claude-key",  label: "Claude API Key",          icon: "key", type: "password", placeholder: "sk-ant-...", required: true })}
+        <div class="mt-1">${renderButton({ variant: "primary", icon: "save", label: "儲存 API 金鑰", onclick: "saveApiKeys()" })}</div>
+      </div>`,
+    }));
+
+    // Storage & Integration
+    renderInto("panel-settings-storage", renderSectionPanel({
+      icon: "cloud", iconColor: "text-status-info",
+      title: "儲存與整合設定", description: "本地資料夾、雲端儲存、Webhook",
+      children: `<div class="flex flex-col gap-4">
+        ${renderInput({ id: "local-path",   label: "本地錄音資料夾",        icon: "folder", placeholder: "D:/AudioFlow/recordings/" })}
+        ${renderInput({ id: "drive-folder", label: "Google Drive 資料夾 ID", icon: "cloud",  placeholder: "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgVE2upms" })}
+        ${renderInput({ id: "webhook-url",  label: "Make Webhook URL",        icon: "link",   placeholder: "https://hook.make.com/..." })}
+        <div class="mt-1 flex gap-3">
+          ${renderButton({ variant: "primary",   icon: "save",      label: "儲存設定",  onclick: "saveStorage()" })}
+          ${renderButton({ variant: "secondary", icon: "plug",      label: "測試連線",  onclick: "testConnection()" })}
+        </div>
+      </div>`,
+    }));
+
+    // Danger zone
+    renderInto("panel-settings-danger", renderSectionPanel({
+      icon: "triangle-alert", iconColor: "text-status-error",
+      title: "危險操作", description: "以下操作不可復原，請謹慎使用",
+      children: `<div class="flex flex-col gap-3">
+        <div class="flex items-center justify-between py-2">
+          <div>
+            <div class="text-sm font-medium">清除所有錄音紀錄</div>
+            <div class="text-xs text-text-muted mt-0.5">刪除本地所有 MP3 檔案與處理紀錄</div>
+          </div>
+          ${renderButton({ variant: "danger", icon: "trash-2", label: "清除全部", onclick: "clearAllRecordings()" })}
+        </div>
+        <div class="flex items-center justify-between py-2 border-t border-border-default">
+          <div>
+            <div class="text-sm font-medium">重置所有設定</div>
+            <div class="text-xs text-text-muted mt-0.5">清除 API 金鑰與所有分發設定</div>
+          </div>
+          ${renderButton({ variant: "danger", icon: "rotate-ccw", label: "重置設定", onclick: "resetSettings()" })}
+        </div>
+      </div>`,
+    }));
+  }
+
+  // ────────────────────────────────────────
+  // 事件處理
+  // ────────────────────────────────────────
+
+  function deleteRecording(id) {
+    const r = recordings.find(r => r.id === id);
+    showConfirmModal({
+      icon: "trash-2", iconBg: "background:#ef444415", iconColor: "text-status-error",
+      title: "刪除錄音",
+      message: `確定要刪除「${r?.name || ""}」？此操作無法復原。`,
+      confirmLabel: "確認刪除", confirmVariant: "danger",
+      onConfirm: () => showToast("錄音已刪除", "success"),
+    });
+  }
+
+  function stopRecording() {
+    showConfirmModal({
+      icon: "square", iconBg: "background:#ff5c5c15", iconColor: "text-accent-primary",
+      title: "停止錄音",
+      message: "停止後將自動切割並上傳至 Google Drive 進行 AI 處理。",
+      confirmLabel: "停止並上傳", confirmVariant: "primary",
+      onConfirm: () => showToast("錄音已停止，自動上傳中...", "info"),
+    });
+  }
+
+  function clearAllRecordings() {
+    showConfirmModal({
+      icon: "trash-2", iconBg: "background:#ef444415", iconColor: "text-status-error",
+      title: "清除所有錄音紀錄",
+      message: "將刪除本地所有 MP3 檔案與處理紀錄，此操作無法復原。",
+      notice: "雲端 Google Drive 的備份不受影響。",
+      confirmLabel: "確認清除", confirmVariant: "danger",
+      onConfirm: () => showToast("所有錄音紀錄已清除", "success"),
+    });
+  }
+
+  function resetSettings() {
+    showConfirmModal({
+      icon: "rotate-ccw", iconBg: "background:#ef444415", iconColor: "text-status-error",
+      title: "重置所有設定",
+      message: "將清除所有 API 金鑰、Webhook URL 與分發設定。",
+      confirmLabel: "確認重置", confirmVariant: "danger",
+      onConfirm: () => showToast("設定已重置", "success"),
+    });
+  }
+
+  function splitRecording()  { showToast("已手動切割目前錄音段", "success"); }
+  function retryProcessing() { showToast("重新觸發處理流程...", "info"); }
+
+  function onDistributionToggle(event, label) {
+    const enabled = event.target.checked;
+    showToast(`${label} 已${enabled ? "啟用" : "停用"}`, enabled ? "success" : "warning");
+  }
+
+  function saveApiKeys() {
+    const w = document.getElementById("whisper-key")?.value;
+    const c = document.getElementById("claude-key")?.value;
+    if (!w || !c) { showToast("請填寫所有必填欄位", "warning"); return; }
+    showToast("API 金鑰已儲存", "success");
+  }
+
+  function saveStorage() { showToast("儲存設定已更新", "success"); }
+
+  function testConnection() {
+    showToast("連線測試中...", "info");
+    setTimeout(() => showToast("Google Drive 與 Make Webhook 連線成功", "success"), 1600);
+  }
+
+  // ────────────────────────────────────────
+  // 初始化
+  // ────────────────────────────────────────
+
+  document.addEventListener("DOMContentLoaded", () => {
+    refreshIcons();
+    renderDashboard();
+  });
+
+  </script>
+</body>
+</html>
