@@ -14,6 +14,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "httpx>=0.28",
     "structlog>=25.1",
+    "pyaudiowpatch>=0.2; sys_platform == 'win32'",
     "pythonnet>=3.0; sys_platform == 'win32'",
     "clr_loader>=0.2; sys_platform == 'win32'",
     "PyGObject>=3.42; sys_platform == 'linux'",
@@ -33,5 +34,5 @@ dev = [
 ]
 
 [build-system]
-requires = ["setuptools"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"

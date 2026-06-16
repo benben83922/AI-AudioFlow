@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import threading
 import logging
@@ -66,33 +67,136 @@ class RecordingMixin:
 
         def _record():
             try:
-                import sounddevice as sd
                 import soundfile as sf
                 import numpy as np
 
-                samplerate = 44100
-                channels = 2
-                frames = []
+                SAMPLERATE = 44100
 
-                def callback(indata, frame_count, time_info, status):
-                    if status:
-                        logger.warning("sounddevice status: %s", status)
-                    frames.append(indata.copy())
+                if sys.platform == "win32":
+                    audio = _record_windows(SAMPLERATE)
+                else:
+                    audio = _record_linux(SAMPLERATE)
 
-                with sd.InputStream(samplerate=samplerate, channels=channels, callback=callback):
-                    while not self._recording_stop_event.is_set():
-                        self._recording_stop_event.wait(timeout=0.1)
-
-                if frames:
-                    audio = np.concatenate(frames, axis=0)
-                    sf.write(str(filepath), audio, samplerate)
+                if audio is not None:
+                    sf.write(str(filepath), audio.astype(np.float32), SAMPLERATE)
                     logger.info("Recording saved: %s", filepath)
-            except ImportError:
-                # sounddevice / soundfile 未安裝時，建立空白佔位檔
-                logger.warning("sounddevice not installed, creating placeholder file")
-                filepath.touch()
+
+            except (ImportError, OSError) as e:
+                logger.error("Audio library unavailable: %s", e)
+                if self._window:
+                    self._window.evaluate_js(
+                        f"showToast('音訊裝置錯誤：{str(e).replace(chr(39), '')}', 'error', 8000)"
+                    )
             except Exception as e:
                 logger.error("Recording error: %s", e)
+
+        def _record_windows(samplerate: int):
+            import pyaudiowpatch as pyaudio
+            import sounddevice as sd
+            import numpy as np
+
+            frames_sys, frames_mic = [], []
+            p = pyaudio.PyAudio()
+            sys_stream = mic_stream = None
+
+            # ── 系統音（WASAPI loopback）──
+            try:
+                wasapi_info = p.get_host_api_info_by_type(pyaudio.paWASAPI)
+                default_out  = p.get_device_info_by_index(wasapi_info["defaultOutputDevice"])
+                loopback_dev = next(
+                    (lb for lb in p.get_loopback_device_info_generator()
+                     if default_out["name"] in lb["name"]),
+                    None,
+                )
+                if loopback_dev:
+                    lb_rate = int(loopback_dev["defaultSampleRate"])
+                    lb_ch   = min(loopback_dev["maxInputChannels"], 2)
+
+                    def sys_cb(in_data, frame_count, time_info, status):
+                        arr = np.frombuffer(in_data, dtype=np.float32).reshape(-1, lb_ch)
+                        if lb_ch == 1:
+                            arr = np.column_stack([arr, arr])
+                        if lb_rate != samplerate:
+                            idx = np.clip(
+                                (np.arange(max(1, int(len(arr) * samplerate / lb_rate))) * lb_rate / samplerate).astype(int),
+                                0, len(arr) - 1,
+                            )
+                            arr = arr[idx]
+                        frames_sys.append(arr)
+                        return (None, pyaudio.paContinue)
+
+                    sys_stream = p.open(
+                        format=pyaudio.paFloat32,
+                        channels=lb_ch, rate=lb_rate,
+                        input=True, input_device_index=loopback_dev["index"],
+                        frames_per_buffer=1024, stream_callback=sys_cb,
+                    )
+                    sys_stream.start_stream()
+                    logger.info("System loopback: %s (%dHz %dch)", loopback_dev["name"], lb_rate, lb_ch)
+                else:
+                    logger.warning("No loopback device found for: %s", default_out["name"])
+            except Exception as e:
+                logger.warning("Cannot open system loopback: %s", e)
+
+            # ── 麥克風 ──
+            try:
+                def mic_cb(indata, *_):
+                    arr = indata.copy()
+                    if arr.shape[1] == 1:
+                        arr = np.column_stack([arr, arr])
+                    frames_mic.append(arr)
+
+                mic_stream = sd.InputStream(samplerate=samplerate, channels=1, callback=mic_cb)
+                mic_stream.start()
+                logger.info("Mic stream opened")
+            except Exception as e:
+                logger.warning("Cannot open mic: %s", e)
+
+            while not self._recording_stop_event.is_set():
+                self._recording_stop_event.wait(timeout=0.1)
+
+            if sys_stream:
+                sys_stream.stop_stream(); sys_stream.close()
+            if mic_stream:
+                mic_stream.stop(); mic_stream.close()
+            p.terminate()
+
+            has_sys, has_mic = bool(frames_sys), bool(frames_mic)
+            if not has_sys and not has_mic:
+                logger.warning("No audio captured")
+                return None
+
+            if has_sys and has_mic:
+                a_sys = np.concatenate(frames_sys, axis=0).astype(np.float32)
+                a_mic = np.concatenate(frames_mic, axis=0).astype(np.float32)
+                n = max(len(a_sys), len(a_mic))
+                a_sys = np.pad(a_sys, ((0, n - len(a_sys)), (0, 0)))
+                a_mic = np.pad(a_mic, ((0, n - len(a_mic)), (0, 0)))
+                audio = np.clip(a_sys * 0.6 + a_mic * 0.6, -1.0, 1.0)
+                logger.info("Mixed sys+mic: %d samples", n)
+            elif has_sys:
+                audio = np.concatenate(frames_sys, axis=0).astype(np.float32)
+            else:
+                audio = np.concatenate(frames_mic, axis=0).astype(np.float32)
+            return audio
+
+        def _record_linux(samplerate: int):
+            import sounddevice as sd
+            import numpy as np
+
+            frames = []
+
+            def callback(indata, *_):
+                frames.append(np.column_stack([indata, indata]))
+
+            with sd.InputStream(device="rdpsource", samplerate=samplerate, channels=1, callback=callback):
+                while not self._recording_stop_event.is_set():
+                    self._recording_stop_event.wait(timeout=0.1)
+
+            if not frames:
+                logger.warning("No audio captured")
+                return None
+            return np.concatenate(frames, axis=0)
 
         self._recording_thread = threading.Thread(target=_record, name="audioflow-recorder", daemon=True)
         self._recording_thread.start()
