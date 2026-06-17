@@ -120,7 +120,9 @@ class RecordingMixin:
                 if audio is not None:
                     # 原子化落地：先寫暫存檔，寫完關檔後再原子改名為最終檔，
                     # 避免取檔端讀到寫一半的檔。
-                    sf.write(str(tmp_path), audio.astype(np.float32), SAMPLERATE)
+                    # 明確指定 WAV 格式：暫存檔副檔名是 .part，soundfile 無法由副檔名
+                    # 推斷格式，必須顯式指定，否則寫檔會失敗、錄音遺失。
+                    sf.write(str(tmp_path), audio.astype(np.float32), SAMPLERATE, format="WAV")
                     os.replace(tmp_path, filepath)
                     logger.info("Recording saved: %s", filepath)
 

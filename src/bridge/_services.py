@@ -72,7 +72,8 @@ class ServicesMixin:
         else:
             cmd = ["docker", "compose", *args]
             kwargs = {"cwd": str(self._project_root)}
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kwargs)
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=timeout, **kwargs)
 
     def _compose_status_all(self) -> dict:
         """一次查回所有 compose 服務的運行狀態：{compose 服務名: running_bool}。"""

@@ -30,7 +30,8 @@ def _popen_kwargs() -> dict:
 def _run_docker(args: list[str], timeout: float = 20) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["docker", *args],
-        capture_output=True, text=True, timeout=timeout,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=timeout,
         **_popen_kwargs(),
     )
 

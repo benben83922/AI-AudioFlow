@@ -36,7 +36,8 @@ def _pid_on_port(port: int) -> int | None:
     try:
         if sys.platform == "win32":
             r = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True,
-                               text=True, timeout=10, creationflags=_CREATE_NO_WINDOW)
+                               text=True, encoding="utf-8", errors="replace",
+                               timeout=10, creationflags=_CREATE_NO_WINDOW)
             for line in r.stdout.splitlines():
                 parts = line.split()
                 # Proto  Local            Foreign          State       PID
@@ -44,7 +45,8 @@ def _pid_on_port(port: int) -> int | None:
                         and parts[1].endswith(f":{port}"):
                     return int(parts[4])
         else:
-            r = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=10)
+            r = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=10)
             for line in r.stdout.splitlines():
                 if f":{port} " in line or line.rstrip().endswith(f":{port}"):
                     m = re.search(r"pid=(\d+)", line)
@@ -59,7 +61,8 @@ def _kill_pid(pid: int) -> bool:
     try:
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True,
-                           text=True, timeout=10, creationflags=_CREATE_NO_WINDOW)
+                           text=True, encoding="utf-8", errors="replace",
+                           timeout=10, creationflags=_CREATE_NO_WINDOW)
         else:
             os.kill(pid, signal.SIGTERM)
         return True
