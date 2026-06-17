@@ -4,14 +4,15 @@
     "claude": ""
   },
   "storage": {
-    "local_path": "D:\\record",
+    "local_path": "C:\\Users\\35575\\source\\vscode\\Ai-AudioFlow\\record",
+    "transcripts_path": "\\\\wsl.localhost\\Ubuntu\\home\\ben_35575\\stt-outbox",
     "drive_folder_id": "",
     "webhook_url": ""
   },
   "distribution": {
     "google_calendar": false,
     "discord": true,
-    "slack": false,
+    "slack": true,
     "obsidian": true,
     "notion": false
   }

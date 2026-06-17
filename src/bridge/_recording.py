@@ -21,6 +21,35 @@ def _fmt_size(bytes_: int) -> str:
         return f"{bytes_ / 1024:.1f} KB"
     return f"{bytes_ / 1024 / 1024:.1f} MB"
 
+# 由音訊緩衝估算 VU 音量（0..1）
+def _calc_level(arr) -> float:
+    import numpy as np
+    a = np.asarray(arr, dtype=np.float64)
+    if a.size == 0:
+        return 0.0
+    rms = float(np.sqrt(np.mean(a ** 2)))
+    return min(1.0, rms * 15.0)
+
+# 列出資料夾內某副檔名的所有檔名主幹（stem）；資料夾不存在 / 不可讀回空集合
+def _stems_in(dir_, ext: str) -> set[str]:
+    if dir_ is None:
+        return set()
+    try:
+        return {p.stem for p in Path(dir_).iterdir() if p.suffix.lower() == ext}
+    except Exception:
+        return set()
+
+# 讀 wav 檔頭取得時長（MM:SS）；失敗回 --:--
+def _wav_duration(path: Path) -> str:
+    try:
+        import soundfile as sf
+        info = sf.info(str(path))
+        if info.samplerate:
+            return _fmt_duration(info.frames / info.samplerate)
+    except Exception:
+        pass
+    return "--:--"
+
 
 class RecordingMixin:
     """音訊擷取 — 錄音控制與本地檔案管理。"""
@@ -29,6 +58,7 @@ class RecordingMixin:
     _recording_stop_event: threading.Event | None = None
     _recording_started_at: float | None = None
     _recording_filename: str | None = None
+    _recording_level: float = 0.0          # 即時音量 0..1（VU 表用）
 
     # ── 錄音控制 ──
 
@@ -46,11 +76,17 @@ class RecordingMixin:
             "recording": is_recording,
             "duration": duration,
             "filename": self._recording_filename or "",
+            "level": round(self._recording_level, 3) if is_recording else 0.0,
         })
 
     def start_recording(self) -> dict:
         if self._recording_thread and self._recording_thread.is_alive():
             return _err(ErrorType.RECORDING_ACTIVE, "錄音已在進行中")
+
+        # 沒裝 Docker Desktop 就不給錄（無法轉譯，錄了也沒下文）
+        env = self.get_environment_status()["data"]
+        if not env["can_record"]:
+            return _err(ErrorType.DOCKER_UNAVAILABLE, env["message"] or "請先安裝 Docker Desktop")
 
         config = self._load_config()
         local_path = config["storage"].get("local_path", "").strip()
@@ -60,10 +96,14 @@ class RecordingMixin:
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
         filename = f"recording_{ts}.wav"
         filepath = recordings_dir / filename
+        # 暫存名（與最終檔同資料夾，確保 os.replace 為原子操作）；
+        # 取檔端（STT worker）的輪詢需略過 .part / 點開頭檔，只收 recording_*.wav
+        tmp_path = recordings_dir / f".{filename}.part"
 
         self._recording_stop_event = threading.Event()
         self._recording_started_at = time.time()
         self._recording_filename = filename
+        self._recording_level = 0.0
 
         def _record():
             try:
@@ -78,7 +118,10 @@ class RecordingMixin:
                     audio = _record_linux(SAMPLERATE)
 
                 if audio is not None:
-                    sf.write(str(filepath), audio.astype(np.float32), SAMPLERATE)
+                    # 原子化落地：先寫暫存檔，寫完關檔後再原子改名為最終檔，
+                    # 避免取檔端讀到寫一半的檔。
+                    sf.write(str(tmp_path), audio.astype(np.float32), SAMPLERATE)
+                    os.replace(tmp_path, filepath)
                     logger.info("Recording saved: %s", filepath)
 
             except (ImportError, OSError) as e:
@@ -123,6 +166,7 @@ class RecordingMixin:
                             )
                             arr = arr[idx]
                         frames_sys.append(arr)
+                        self._recording_level = _calc_level(arr)
                         return (None, pyaudio.paContinue)
 
                     sys_stream = p.open(
@@ -145,6 +189,9 @@ class RecordingMixin:
                     if arr.shape[1] == 1:
                         arr = np.column_stack([arr, arr])
                     frames_mic.append(arr)
+                    # 無系統 loopback 時，麥克風即為音量來源
+                    if not sys_stream:
+                        self._recording_level = _calc_level(arr)
 
                 mic_stream = sd.InputStream(samplerate=samplerate, channels=1, callback=mic_cb)
                 mic_stream.start()
@@ -188,6 +235,7 @@ class RecordingMixin:
 
             def callback(indata, *_):
                 frames.append(np.column_stack([indata, indata]))
+                self._recording_level = _calc_level(indata)
 
             with sd.InputStream(device="rdpsource", samplerate=samplerate, channels=1, callback=callback):
                 while not self._recording_stop_event.is_set():
@@ -217,6 +265,7 @@ class RecordingMixin:
         self._recording_stop_event = None
         self._recording_started_at = None
         self._recording_filename = None
+        self._recording_level = 0.0
 
         return _ok({"filename": filename, "duration": _fmt_duration(elapsed)})
 
@@ -231,12 +280,19 @@ class RecordingMixin:
     # ── 檔案管理 ──
 
     def list_recordings(self) -> dict:
-        config = self._load_config()
-        local_path = config["storage"].get("local_path", "").strip()
-        recordings_dir = Path(local_path) if local_path else self._recordings_dir
-
+        recordings_dir = self._recordings_dir_path()
         if not recordings_dir.exists():
             return _ok([])
+
+        # 交叉比對逐字稿 / 會議紀錄資料夾，推導每筆錄音的生命週期階段
+        txt_stems = _stems_in(self._transcripts_dir_path(), ".txt")
+        md_stems = _stems_in(self._results_dir_path(), ".md")
+        active_stem = (
+            Path(self._recording_filename).stem
+            if (self._recording_filename and self._recording_thread
+                and self._recording_thread.is_alive())
+            else None
+        )
 
         items = []
         for path in sorted(recordings_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
@@ -252,12 +308,27 @@ class RecordingMixin:
             else:
                 time_str = mtime.strftime("%m/%d %H:%M")
 
+            stem = path.stem
+            has_transcript = stem in txt_stems
+            has_result = stem in md_stems
+            if active_stem and stem == active_stem:
+                status = "recording"
+            elif has_result:
+                status = "done"
+            elif has_transcript:
+                status = "summarizing"
+            else:
+                status = "transcribing"
+
             items.append({
                 "id": path.name,
                 "name": path.name,
+                "stem": stem,
                 "size": _fmt_size(stat.st_size),
-                "duration": "--:--",
-                "status": "done",
+                "duration": _wav_duration(path),
+                "status": status,
+                "has_transcript": has_transcript,
+                "has_result": has_result,
                 "time": time_str,
                 "path": str(path),
             })

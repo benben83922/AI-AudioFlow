@@ -6,25 +6,28 @@ from src.bridge._helpers import _ok, _err, ErrorType
 logger = logging.getLogger(__name__)
 
 
-# 處理步驟定義
-_PIPELINE_STEPS = [
-    {"key": "upload",    "name": "上傳至 Google Drive",     "description": "將 MP3 上傳至雲端儲存空間"},
-    {"key": "webhook",   "name": "Webhook 觸發 Make",       "description": "自動化平台收到上傳事件"},
-    {"key": "whisper",   "name": "Whisper 語音轉文字",      "description": "OpenAI Whisper API 轉譯"},
-    {"key": "claude",    "name": "Claude 結構化摘要",       "description": "Claude API 生成 Markdown 摘要"},
-    {"key": "calendar",  "name": "Google 日曆建立行程",     "description": "自動建立會議記錄"},
-    {"key": "distribute","name": "Discord / Obsidian 分發", "description": "推送通知並備份筆記"},
-]
+def _safe_stem(stem: str) -> str | None:
+    """防路徑穿越：stem 不得含路徑分隔或上層參照。"""
+    if not stem or "/" in stem or "\\" in stem or ".." in stem:
+        return None
+    return stem
+
+
+def _count_ext(dir_, ext: str) -> int:
+    if dir_ is None:
+        return 0
+    try:
+        return sum(1 for p in Path(dir_).iterdir() if p.suffix.lower() == ext)
+    except Exception:
+        return 0
 
 
 class ProcessingMixin:
-    """AI 處理 — Whisper 轉譯、Claude 摘要、進度追蹤。"""
+    """成果讀取 — 逐字稿與會議紀錄的檢視 / 匯出，以及真實統計。"""
 
     def get_stats(self) -> dict:
-        """取得儀表板統計數字。"""
-        config = self._load_config()
-        local_path = config["storage"].get("local_path", "").strip()
-        recordings_dir = Path(local_path) if local_path else self._recordings_dir
+        """儀表板統計：今日錄音數、已轉譯逐字稿、已生成會議紀錄（皆為真實計數）。"""
+        recordings_dir = self._recordings_dir_path()
 
         recordings_today = 0
         if recordings_dir.exists():
@@ -37,40 +40,71 @@ class ProcessingMixin:
 
         return _ok({
             "recordings_today": recordings_today,
-            "transcriptions_total": 0,
-            "distributions_total": 0,
+            "transcriptions_total": _count_ext(self._transcripts_dir_path(), ".txt"),
+            "results_total": _count_ext(self._results_dir_path(), ".md"),
         })
 
-    def get_pipeline_status(self) -> dict:
-        """取得當前錄音的處理流程狀態（示範用）。"""
-        steps = [
-            {**s, "status": "pending", "detail": ""}
-            for s in _PIPELINE_STEPS
-        ]
-        return _ok({
-            "recording_name": "尚無進行中的處理",
-            "steps": steps,
-        })
+    # ── 成果讀取 ──
 
-    def retry_processing(self, filename: str) -> dict:
-        """重新觸發指定錄音的處理流程。"""
-        config = self._load_config()
-        local_path = config["storage"].get("local_path", "").strip()
-        recordings_dir = Path(local_path) if local_path else self._recordings_dir
-        target = recordings_dir / filename
+    def get_result(self, stem: str) -> dict:
+        """讀取某錄音的會議紀錄（openclaw 輸出的 .md）。"""
+        stem = _safe_stem(stem)
+        if stem is None:
+            return _err(ErrorType.VALIDATION, "非法的檔名")
+        results_dir = self._results_dir_path()
+        if results_dir is None:
+            return _err(ErrorType.VALIDATION, "尚未設定會議紀錄輸出資料夾")
+        src = Path(results_dir) / f"{stem}.md"
+        if not src.exists():
+            return _err(ErrorType.NOT_FOUND, "會議紀錄尚未生成")
+        try:
+            return _ok({"stem": stem, "content": src.read_text(encoding="utf-8")})
+        except Exception as e:
+            return _err(ErrorType.INTERNAL, str(e))
 
-        if not target.exists():
-            return _err(ErrorType.NOT_FOUND, f"找不到檔案：{filename}")
+    def get_transcript(self, stem: str) -> dict:
+        """讀取某錄音的逐字稿（STT worker 輸出的 .txt）。"""
+        stem = _safe_stem(stem)
+        if stem is None:
+            return _err(ErrorType.VALIDATION, "非法的檔名")
+        transcripts_dir = self._transcripts_dir_path()
+        if transcripts_dir is None:
+            return _err(ErrorType.VALIDATION, "尚未設定逐字稿資料夾")
+        src = Path(transcripts_dir) / f"{stem}.txt"
+        if not src.exists():
+            return _err(ErrorType.NOT_FOUND, "逐字稿尚未生成")
+        try:
+            return _ok({"stem": stem, "content": src.read_text(encoding="utf-8")})
+        except Exception as e:
+            return _err(ErrorType.INTERNAL, str(e))
 
-        webhook_url = config["storage"].get("webhook_url", "").strip()
-        if not webhook_url:
-            return _err(ErrorType.VALIDATION, "尚未設定 Webhook URL，請先至設定頁填寫")
+    def export_result(self, stem: str) -> dict:
+        """以系統存檔對話框把會議紀錄另存到使用者選的位置。"""
+        stem = _safe_stem(stem)
+        if stem is None:
+            return _err(ErrorType.VALIDATION, "非法的檔名")
+        results_dir = self._results_dir_path()
+        if results_dir is None:
+            return _err(ErrorType.VALIDATION, "尚未設定會議紀錄輸出資料夾")
+        src = Path(results_dir) / f"{stem}.md"
+        if not src.exists():
+            return _err(ErrorType.NOT_FOUND, "會議紀錄尚未生成")
+        if not self._window:
+            return _err(ErrorType.INTERNAL, "視窗尚未就緒")
 
         try:
-            import httpx
-            with httpx.Client(timeout=15) as client:
-                client.post(webhook_url, json={"filename": filename, "action": "retry"})
-            logger.info("Retry triggered for: %s", filename)
-            return _ok()
+            import webview
+            content = src.read_text(encoding="utf-8")
+            chosen = self._window.create_file_dialog(
+                webview.SAVE_DIALOG,
+                save_filename=f"{stem}.md",
+                file_types=("Markdown 檔 (*.md)", "所有檔案 (*.*)"),
+            )
+            if not chosen:
+                return _ok({"saved": False})
+            dest = chosen if isinstance(chosen, str) else chosen[0]
+            Path(dest).write_text(content, encoding="utf-8")
+            logger.info("會議紀錄已匯出：%s", dest)
+            return _ok({"saved": True, "path": str(dest)})
         except Exception as e:
-            return _err(ErrorType.CONNECTION_ERROR, str(e))
+            return _err(ErrorType.INTERNAL, str(e))

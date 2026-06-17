@@ -16,6 +16,10 @@ logger = logging.getLogger(__name__)
 def _on_started(bridge, window) -> None:
     bridge.set_window(window)
     logger.info("AudioFlow: window ready")
+    # 隨 app 啟動：四個背景服務一起拉起（whisper 容器、STT worker、
+    # llm-service、openclaw）。每個服務各自會先判斷是否已在執行才啟動。
+    # 啟動皆為非阻塞，狀態由前端「服務管理」頁輪詢顯示。
+    bridge.start_all_services_async()
 
 
 def main() -> None:

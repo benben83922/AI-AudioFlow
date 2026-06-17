@@ -1,0 +1,61 @@
+# 下游兩個服務：LLM 服務 + OpenClaw。
+# 一鍵起：  docker compose up -d --build
+#
+# 注意：whisper 容器與 STT worker 由 AudioFlow app 自動管理，「不」在這個 compose 裡。
+# 這份只負責「逐字稿 → 整理」這半段。
+
+services:
+  # ── LLM 服務：對外 OpenAI 相容，對內跑 claude -p（訂閱）。不碰任何檔案。 ──
+  llm-service:
+    build: ./llm-service
+    # 以非 root 的 node 使用者執行（claude 拒絕用 root 跑 --dangerously-skip-permissions）
+    user: "node"
+    environment:
+      # 訂閱 token：在你本機跑 `claude setup-token`，把結果放進專案根目錄的 .env：
+      #   CLAUDE_CODE_OAUTH_TOKEN=...
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?請在 .env 設定 CLAUDE_CODE_OAUTH_TOKEN（claude setup-token 取得）}
+      CLAUDE_MODEL: ${CLAUDE_MODEL:-opus}
+      HOME: /home/node          # claude 的設定 / 快取目錄
+    restart: unless-stopped
+    networks: [audioflow]
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8088/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── 權限初始化：openclaw 以 uid 1000 執行，但 bind mount 的輸出目錄常被 Docker 以
+  #    root 自動建立，導致 openclaw 寫不進去。先用 root 把擁有者改成 openclaw 的執行身分，
+  #    跑完即退出（openclaw 等它成功後才啟動）。 ──
+  init-perms:
+    image: busybox
+    user: root
+    volumes:
+      - /home/ben_35575/openclaw-out:/out        # 整理結果輸出目錄（需可寫）
+    command: sh -c "chown -R ${HOST_UID:-1000}:${HOST_GID:-1000} /out"
+    restart: "no"
+
+  # ── OpenClaw：輪詢逐字稿 → 呼叫 LLM 服務 → 原子化寫出。檔案歸它。 ──
+  openclaw:
+    build: ./openclaw
+    # 以你的 WSL uid:gid 執行，寫出的檔屬於你、不會變 root
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      LLM_BASE_URL: http://llm-service:8088/v1   # 同 network，用容器名互連
+      LLM_MODEL: ${CLAUDE_MODEL:-opus}
+      POLL_INTERVAL: "10"
+    volumes:
+      - /home/ben_35575/stt-outbox:/in:ro        # 逐字稿，唯讀（最小權限）
+      - /home/ben_35575/openclaw-out:/out        # 整理結果，可寫
+    depends_on:
+      llm-service:
+        condition: service_healthy               # 等 LLM 服務健康才啟動
+      init-perms:
+        condition: service_completed_successfully # 等權限修好才啟動
+    restart: unless-stopped
+    networks: [audioflow]
+
+networks:
+  audioflow:
+    driver: bridge

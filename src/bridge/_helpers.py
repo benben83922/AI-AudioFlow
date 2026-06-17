@@ -12,6 +12,7 @@ class ErrorType(enum.Enum):
     RECORDING_INACTIVE = "RECORDING_INACTIVE"
     NO_DEVICE = "NO_DEVICE"
     API_ERROR = "API_ERROR"
+    DOCKER_UNAVAILABLE = "DOCKER_UNAVAILABLE"
 
 
 def _ok(data: Any = None) -> dict:

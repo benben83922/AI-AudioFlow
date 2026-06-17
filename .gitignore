@@ -18,7 +18,16 @@ env/
 # dotenv
 .env
 .env.*
+# 範本不含密鑰，需要上版控
+!.env.example
+
+# 錄音音檔（二進位、體積大、含會議內容，不進版控）
+record/
 
 # OS
 .DS_Store
 Thumbs.db
+
+# STT worker 執行期產物
+stt-worker/worker.pid
+stt-worker/worker.log
