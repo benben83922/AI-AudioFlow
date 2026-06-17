@@ -4,8 +4,8 @@
     "claude": ""
   },
   "storage": {
-    "local_path": "C:\\Users\\35575\\source\\vscode\\Ai-AudioFlow\\record",
-    "transcripts_path": "\\\\wsl.localhost\\Ubuntu\\home\\ben_35575\\stt-outbox",
+    "local_path": "D:\\record",
+    "transcripts_path": "\\\\wsl.localhost\\Ubuntu\\home\\benben83922\\stt-outbox",
     "drive_folder_id": "",
     "webhook_url": ""
   },

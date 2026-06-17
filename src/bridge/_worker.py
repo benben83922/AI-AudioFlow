@@ -23,16 +23,36 @@ DEFAULT_LANGUAGE = "zh"
 _CREATE_NO_WINDOW = 0x08000000    # Windows：不閃主控台視窗
 
 
-def _worker_running(port: int = WORKER_LOCK_PORT) -> bool:
-    """嘗試連線單例鎖 port；連得上代表 worker 正在執行。"""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.settimeout(0.5)
-        return s.connect_ex(("127.0.0.1", port)) == 0
+def _worker_running(port: int = WORKER_LOCK_PORT, pid_file: "Path | None" = None) -> bool:
+    """Windows 側 worker 的單例鎖 port 用 listen(1) 且從不 accept()，
+    connect_ex 連一次就塞滿 backlog，導致後續全部被拒。
+    改用 powershell.exe Get-NetTCPConnection 查詢監聽狀態（Windows / WSL2 皆適用）。
+    """
+    return _win_port_listening(port)
+
+
+def _win_port_listening(port: int) -> bool:
+    """用 powershell.exe 確認 Windows 端是否有程序監聽指定 port。
+    在 Windows 原生與 WSL2 環境下皆可呼叫。
+    """
+    try:
+        r = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-Command",
+                f"(Get-NetTCPConnection -LocalPort {port} -State Listen"
+                f" -ErrorAction SilentlyContinue) -ne $null",
+            ],
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=5,
+        )
+        return r.stdout.strip().upper() == "TRUE"
+    except Exception:
+        return False
 
 
 def _pid_on_port(port: int) -> int | None:
-    """備援：當 pidfile 遺失（例如 worker 是前一個 app 實例拉起的）時，
-    用系統工具找出占用 lock port 的 PID。"""
+    """找出占用 lock port 的 Windows PID。
+    Windows 原生用 netstat；WSL2 用 powershell.exe Get-NetTCPConnection。"""
     try:
         if sys.platform == "win32":
             r = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True,
@@ -40,31 +60,38 @@ def _pid_on_port(port: int) -> int | None:
                                timeout=10, creationflags=_CREATE_NO_WINDOW)
             for line in r.stdout.splitlines():
                 parts = line.split()
-                # Proto  Local            Foreign          State       PID
                 if len(parts) >= 5 and parts[3].upper() == "LISTENING" \
                         and parts[1].endswith(f":{port}"):
                     return int(parts[4])
         else:
-            r = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True,
-                               encoding="utf-8", errors="replace", timeout=10)
-            for line in r.stdout.splitlines():
-                if f":{port} " in line or line.rstrip().endswith(f":{port}"):
-                    m = re.search(r"pid=(\d+)", line)
-                    if m:
-                        return int(m.group(1))
+            # WSL2：透過 powershell.exe 查 Windows 端的 TCP 監聽程序
+            r = subprocess.run(
+                [
+                    "powershell.exe", "-NoProfile", "-Command",
+                    f"(Get-NetTCPConnection -LocalPort {port} -State Listen"
+                    f" -ErrorAction SilentlyContinue).OwningProcess",
+                ],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=5,
+            )
+            pid_str = r.stdout.strip()
+            if pid_str.isdigit():
+                return int(pid_str)
     except Exception as e:
         logger.warning("查詢 port %d 的 PID 失敗：%s", port, e)
     return None
 
 
 def _kill_pid(pid: int) -> bool:
+    """終止指定 PID。Windows 原生用 taskkill；WSL2 用 taskkill.exe。"""
     try:
         if sys.platform == "win32":
             subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True,
                            text=True, encoding="utf-8", errors="replace",
                            timeout=10, creationflags=_CREATE_NO_WINDOW)
         else:
-            os.kill(pid, signal.SIGTERM)
+            subprocess.run(["taskkill.exe", "/PID", str(pid), "/F"], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=10)
         return True
     except Exception as e:
         logger.error("終止 PID %s 失敗：%s", pid, e)

@@ -233,6 +233,17 @@
     }
   }
 
+  // 用於不回傳 data 的寫入操作（_ok() data=None 仍算成功）
+  async function callApiOk(method, ...args) {
+    try {
+      const r = await window.pywebview.api[method](...args);
+      return r?.success === true;
+    } catch (e) {
+      console.warn("[callApiOk]", method, e);
+      return false;
+    }
+  }
+
   async function callApiOrToast(method, errorMsg, ...args) {
     const result = await callApi(method, ...args);
     if (result === null) showToast(errorMsg || `操作失敗（${method}）`, "error");
@@ -949,16 +960,16 @@
     if (!w || w === "••••••••" || !c || c === "••••••••") {
       showToast("請填入真實的 API 金鑰", "warning"); return;
     }
-    const result = await callApi("save_api_keys", w, c);
-    result !== null ? showToast("API 金鑰已儲存", "success") : showToast("儲存失敗", "error");
+    const ok = await callApiOk("save_api_keys", w, c);
+    ok ? showToast("API 金鑰已儲存", "success") : showToast("儲存失敗", "error");
   }
 
   async function saveStorage() {
     const local    = document.getElementById("local-path")?.value?.trim()   || "";
     const driveId  = document.getElementById("drive-folder")?.value?.trim() || "";
     const webhook  = document.getElementById("webhook-url")?.value?.trim()  || "";
-    const result = await callApi("save_storage_settings", local, driveId, webhook);
-    result !== null ? showToast("儲存設定已更新", "success") : showToast("儲存失敗", "error");
+    const ok = await callApiOk("save_storage_settings", local, driveId, webhook);
+    ok ? showToast("儲存設定已更新", "success") : showToast("儲存失敗", "error");
   }
 
   async function testConnection() {

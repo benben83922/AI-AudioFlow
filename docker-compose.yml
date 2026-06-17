@@ -32,7 +32,7 @@ services:
     image: busybox
     user: root
     volumes:
-      - /home/ben_35575/openclaw-out:/out        # 整理結果輸出目錄（需可寫）
+      - /home/benben83922/openclaw-out:/out        # 整理結果輸出目錄（需可寫）
     command: sh -c "chown -R ${HOST_UID:-1000}:${HOST_GID:-1000} /out"
     restart: "no"
 
@@ -46,8 +46,8 @@ services:
       LLM_MODEL: ${CLAUDE_MODEL:-opus}
       POLL_INTERVAL: "10"
     volumes:
-      - /home/ben_35575/stt-outbox:/in:ro        # 逐字稿，唯讀（最小權限）
-      - /home/ben_35575/openclaw-out:/out        # 整理結果，可寫
+      - /home/benben83922/stt-outbox:/in:ro        # 逐字稿，唯讀（最小權限）
+      - /home/benben83922/openclaw-out:/out        # 整理結果，可寫
     depends_on:
       llm-service:
         condition: service_healthy               # 等 LLM 服務健康才啟動
