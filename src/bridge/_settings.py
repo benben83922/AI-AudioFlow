@@ -44,7 +44,8 @@ class SettingsMixin:
         config = self._load_config()
         config["storage"]["local_path"] = local_path.strip()
         token = (claude_token or "").strip()
-        if token and set(token) > {"•"}:
+        # 非空、且不是「全是遮罩圓點」才存（避免把 •••• 當成 token）
+        if token and set(token) != {"•"}:
             config["api_keys"]["claude"] = token
         config["setup_done"] = True
         self._save_config(config)

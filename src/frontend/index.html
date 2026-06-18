@@ -359,10 +359,10 @@
     refreshIcons();
   }
 
-  function renderStatusBadge({ status, text }) {
+  function renderStatusBadge({ status, text, pulse=false }) {
     const c = { success:{dot:"bg-status-success",bg:"bg-[#22c55e18]",txt:"text-status-success"}, error:{dot:"bg-status-error",bg:"bg-[#ef444418]",txt:"text-status-error"}, warning:{dot:"bg-[#eab308]",bg:"bg-[#eab30818]",txt:"text-[#eab308]"}, info:{dot:"bg-status-info",bg:"bg-[#3b82f618]",txt:"text-status-info"} }[status] || {dot:"bg-status-info",bg:"bg-[#3b82f618]",txt:"text-status-info"};
     return `<span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full ${c.bg} ${c.txt} text-xs font-medium whitespace-nowrap">
-      <span class="w-1.5 h-1.5 rounded-full ${c.dot}"></span>${esc(text)}
+      <span class="w-1.5 h-1.5 rounded-full ${c.dot} ${pulse?"animate-pulse":""}"></span>${esc(text)}
     </span>`;
   }
 
@@ -766,7 +766,7 @@
         <div class="text-sm font-medium">${esc(svc.name || meta.key)}</div>
         <div class="text-xs text-text-muted mt-0.5 truncate">${sub}</div>
       </div>
-      ${renderStatusBadge({ status: sm.s, text: sm.t })}
+      ${renderStatusBadge({ status: sm.s, text: sm.t, pulse: transient })}
       ${btn}
     </div>`;
   }
@@ -869,9 +869,9 @@
       icon: "key", iconColor: "text-warn",
       title: "API 金鑰 / Token", description: "LLM 整理服務所需的 Claude 訂閱 Token",
       children: `<div class="flex flex-col gap-4">
-        ${renderInput({ id:"claude-key",  label:"Claude 訂閱 Token", icon:"key-round", type:"password", placeholder:"claude setup-token 取得", value: keys.claude ? "••••••••" : "", required:true })}
-        <div class="text-xs text-text-muted -mt-2">LLM／OpenClaw 服務啟動的必要條件；未填則只做錄音與轉譯。</div>
-        ${renderInput({ id:"whisper-key", label:"Whisper API Key（選填，目前未使用）", icon:"key", type:"password", placeholder:"sk-...", value: keys.whisper ? "••••••••" : "" })}
+        ${renderInput({ id:"claude-key",  label:"Claude 訂閱 Token", icon:"key-round", type:"password", placeholder:"claude setup-token 取得", value: keys.claude || "", required:true })}
+        <div class="text-xs text-text-muted -mt-2">LLM／OpenClaw 服務啟動的必要條件；未填則只做錄音與轉譯。點右側眼睛可顯示完整 Token。</div>
+        ${renderInput({ id:"whisper-key", label:"Whisper API Key（選填，目前未使用）", icon:"key", type:"password", placeholder:"sk-...", value: keys.whisper || "" })}
         <div class="mt-1">${renderButton({ variant:"primary", icon:"save", label:"儲存", onclick:"saveApiKeys()" })}</div>
       </div>`,
     }));

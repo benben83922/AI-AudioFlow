@@ -54,6 +54,7 @@ class ServicesMixin:
     _compose_lock = threading.Lock()
     _services_cache: tuple[float, dict] | None = None  # (時間, status dict)
     _shutting_down = False  # 關閉流程已確認 → 放行視窗關閉
+    _starting: set = set()  # 正在啟動中的服務 key（讓前端顯示「啟動中」）
 
     # ── docker compose 執行（Windows 走 WSL）──
 
@@ -203,6 +204,8 @@ class ServicesMixin:
         if self._stt_status in ("pulling", "starting"):
             return self._svc("whisper", running=False, status=self._stt_status,
                              message=self._stt_message)
+        if "whisper" in self._starting:
+            return self._svc("whisper", running=False, status="starting")
         return self._svc("whisper", running=False,
                          status="stopped" if cs == "stopped" else "absent")
 
@@ -218,13 +221,11 @@ class ServicesMixin:
         docker_ok = docker_state == "ok"
 
         worker_up = _worker_running()
+        worker_status = "running" if worker_up else (
+            "starting" if "stt_worker" in self._starting else "stopped")
         out: dict = {
             "whisper": self._whisper_status(docker_ok, docker_msg),
-            "stt_worker": self._svc(
-                "stt_worker",
-                running=worker_up,
-                status="running" if worker_up else "stopped",
-            ),
+            "stt_worker": self._svc("stt_worker", running=worker_up, status=worker_status),
         }
 
         compose = self._compose_status_all() if docker_ok else {}
@@ -233,8 +234,9 @@ class ServicesMixin:
                 out[key] = self._svc(key, running=False, status="error", message=docker_msg)
             else:
                 running = compose.get(svc, False)
-                out[key] = self._svc(key, running=running,
-                                     status="running" if running else "stopped")
+                status = "running" if running else (
+                    "starting" if key in self._starting else "stopped")
+                out[key] = self._svc(key, running=running, status=status)
 
         self.__class__._services_cache = (now, out)
         return _ok(out)
@@ -316,18 +318,27 @@ class ServicesMixin:
         if not ok:
             return _err(ErrorType.DOCKER_UNAVAILABLE, msg)
 
+        # 標記「啟動中」→ 前端立即顯示啟動中、停用啟動鈕；背景啟動完成才清除
+        self.__class__._starting.add(key)
         self.__class__._services_cache = None
 
         if key == "whisper":
-            self.start_stt_async()                       # 內部會先判斷容器是否已在跑
+            target, args = self.ensure_stt_container, ()
         elif key == "stt_worker":
-            threading.Thread(target=self.start_worker_detached,
-                             name="svc-start-worker", daemon=True).start()  # 內部判斷 port 是否被占
+            target, args = self.start_worker_detached, ()
         else:
-            svc = COMPOSE_SVC[key]
-            threading.Thread(target=self._compose_up, args=(svc,),
-                             name=f"svc-up-{svc}", daemon=True).start()
+            target, args = self._compose_up, (COMPOSE_SVC[key],)
 
+        def _run():
+            try:
+                target(*args)
+            except Exception as e:
+                logger.error("啟動 %s 失敗：%s", key, e)
+            finally:
+                self.__class__._starting.discard(key)
+                self.__class__._services_cache = None
+
+        threading.Thread(target=_run, name=f"svc-start-{key}", daemon=True).start()
         return _ok({"message": f"{SERVICE_META[key]['name']} 啟動中…"})
 
     def stop_service(self, key: str) -> dict:
@@ -382,11 +393,16 @@ class ServicesMixin:
         """
         if self.__class__._shutting_down:
             return True
-        try:
-            if self._window:
-                self._window.evaluate_js("window.__confirmShutdown && window.__confirmShutdown()")
-        except Exception as e:
-            logger.warning("呼叫前端確認關閉失敗：%s", e)
+        # 重要：絕不可在這個 closing 事件（GUI 主執行緒）裡「同步」呼叫 evaluate_js——
+        # EdgeChromium 後端的 evaluate_js 需要主執行緒跑 JS，而主執行緒正卡在這個
+        # 事件處理裡 → 互等死鎖（整個 UI 凍結、確認彈窗都出不來）。改丟背景執行緒呼叫。
+        def _ask_frontend():
+            try:
+                if self._window:
+                    self._window.evaluate_js("window.__confirmShutdown && window.__confirmShutdown()")
+            except Exception as e:
+                logger.warning("呼叫前端確認關閉失敗：%s", e)
+        threading.Thread(target=_ask_frontend, name="ask-shutdown", daemon=True).start()
         return False  # 取消本次關閉，等使用者於彈窗確認
 
     def stop_all_services_sync(self) -> None:
@@ -408,16 +424,28 @@ class ServicesMixin:
         self.__class__._services_cache = None
 
     def shutdown_app(self) -> dict:
-        """前端確認關閉後呼叫：停掉所有服務，完成後關閉主視窗。"""
+        """前端確認關閉後呼叫：停服務 + 關視窗，但「立即返回」。
+
+        關鍵：不可在這個 js_api 呼叫裡同步做完再 destroy() —— 那會讓 GUI 主執行緒
+        卡在等這個呼叫返回，而 destroy() 又需要主執行緒處理 → 死鎖（停服務與關窗都卡住）。
+        先 return 讓 JS 的 await 解決、主執行緒解放，背景執行緒再停服務、再 destroy。
+        """
+        if self.__class__._shutting_down:
+            return _ok({"message": "關閉中"})
         self.__class__._shutting_down = True
-        logger.info("關閉中：停止所有背景服務…")
-        try:
-            self.stop_all_services_sync()
-        finally:
+
+        def _stop_and_close():
+            logger.info("關閉中：停止所有背景服務…")
+            try:
+                self.stop_all_services_sync()
+            except Exception as e:
+                logger.error("停止服務時發生例外：%s", e)
             logger.info("服務已停止，關閉視窗")
-            if self._window:
-                try:
+            try:
+                if self._window:
                     self._window.destroy()
-                except Exception as e:
-                    logger.error("關閉視窗失敗：%s", e)
-        return _ok({"message": "已關閉"})
+            except Exception as e:
+                logger.error("關閉視窗失敗：%s", e)
+
+        threading.Thread(target=_stop_and_close, name="app-shutdown", daemon=True).start()
+        return _ok({"message": "關閉中"})
