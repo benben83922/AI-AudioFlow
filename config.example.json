@@ -1,0 +1,21 @@
+{
+  "setup_done": false,
+  "api_keys": {
+    "whisper": "",
+    "claude": ""
+  },
+  "storage": {
+    "local_path": "",
+    "transcripts_path": "",
+    "results_path": "",
+    "drive_folder_id": "",
+    "webhook_url": ""
+  },
+  "distribution": {
+    "google_calendar": false,
+    "discord": true,
+    "slack": true,
+    "obsidian": true,
+    "notion": false
+  }
+}

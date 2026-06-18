@@ -14,6 +14,9 @@ const { spawn } = require("child_process");
 
 const PORT = process.env.PORT || 8088;
 const MODEL = process.env.CLAUDE_MODEL || "opus";
+// claude -p 子程序逾時（毫秒）。逾時即殺掉，避免 claude 卡住時請求永久懸著。
+// 預設 600s，與 openclaw 端的 LLM_TIMEOUT 一致；可用 CLAUDE_TIMEOUT_MS 覆寫。
+const CLAUDE_TIMEOUT_MS = parseInt(process.env.CLAUDE_TIMEOUT_MS || "600000", 10);
 
 // 把 OpenAI 的 content（字串或 parts 陣列）攤平成純文字
 function contentToText(content) {
@@ -34,12 +37,31 @@ function runClaude(conversation, systemText) {
     if (systemText) args.push("--append-system-prompt", systemText);
 
     const child = spawn("claude", args, { stdio: ["pipe", "pipe", "pipe"] });
-    let out = "", err = "";
+    let out = "", err = "", settled = false;
+
+    // 逾時守衛：先 SIGTERM，5s 後仍在就 SIGKILL，並以錯誤結束 Promise
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill("SIGTERM"); } catch (_) {}
+      setTimeout(() => { try { child.kill("SIGKILL"); } catch (_) {} }, 5000);
+      reject(new Error(`claude 逾時（${CLAUDE_TIMEOUT_MS}ms）已中止`));
+    }, CLAUDE_TIMEOUT_MS);
+
+    const finish = (fn, arg) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(arg);
+    };
+
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
-    child.on("error", reject);
+    child.on("error", (e) => finish(reject, e));
     child.on("close", (code) =>
-      code === 0 ? resolve(out) : reject(new Error(err.trim() || `claude exit ${code}`))
+      code === 0
+        ? finish(resolve, out)
+        : finish(reject, new Error(err.trim() || `claude exit ${code}`))
     );
     child.stdin.write(conversation);
     child.stdin.end();

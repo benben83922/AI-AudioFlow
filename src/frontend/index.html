@@ -554,12 +554,15 @@
   }
 
   function _renderRecControl(isRecording) {
-    // 引擎尚未就緒的誠實提示（可錄，但會先排隊）
+    // 無法錄音時，顯示後端回報的「實際阻擋原因」（依賴未裝/未開、無音訊裝置、服務未就緒…）
     let hint = "";
     if (!_canRecord) {
-      hint = `<p class="mt-3 text-xs text-status-error flex items-center gap-1.5"><i data-lucide="alert-octagon" class="w-3.5 h-3.5"></i>需安裝並啟動 Docker Desktop 後才能開始錄音</p>`;
-    } else if (!_sttReady) {
-      hint = `<p class="mt-3 text-xs text-warn flex items-center gap-1.5"><i data-lucide="alert-triangle" class="w-3.5 h-3.5"></i>語音辨識引擎尚未就緒，現在錄音會先排隊，待引擎啟動後自動轉譯</p>`;
+      const transient = _envBlocker === "services";
+      const cls = transient ? "text-warn" : "text-status-error";
+      const icon = transient ? "loader" : "alert-octagon";
+      const spin = transient ? "animate-spin" : "";
+      const msg = _envMessage || "尚未就緒，無法開始錄音";
+      hint = `<p class="mt-3 text-xs ${cls} flex items-center gap-1.5"><i data-lucide="${icon}" class="w-3.5 h-3.5 ${spin}"></i>${esc(msg)}</p>`;
     }
 
     const vu = isRecording ? `
@@ -593,6 +596,8 @@
     }));
   }
 
+  let _recListTimer = null;
+
   async function _refreshRecordingList() {
     const recordings = await callApi("list_recordings");
     const rows = recordings?.length
@@ -605,6 +610,13 @@
       children: rows,
       headerActions: renderButton({ variant:"secondary", icon:"refresh-cw", label:"重新整理", size:"sm", onclick:"_refreshRecordingList()" }),
     }));
+
+    // 有檔案在轉譯/生成中 → 每 5s 自動刷新讓進度 % 跟著動；都閒置就停
+    clearTimeout(_recListTimer);
+    const busy = recordings?.some(r => r.status === "transcribing" || r.status === "summarizing");
+    if (busy && document.getElementById("panel-rec-list")) {
+      _recListTimer = setTimeout(_refreshRecordingList, 5000);
+    }
   }
 
   const REC_STAGE = {
@@ -619,6 +631,29 @@
     const stem = (r.stem || "").replace(/'/g, "\\'");
     const id = r.id.replace(/'/g, "\\'");
 
+    // 轉譯進度（僅 transcribing 階段）：有標記=轉譯中(估 %)，無標記=排隊中
+    let badge, progLine = "";
+    if (r.status === "transcribing" && r.progress) {
+      if (!r.progress.active) {
+        badge = renderStatusBadge({ status:"info", text:"排隊中" });
+        progLine = `<div class="text-xs text-text-muted mt-1 flex items-center gap-1.5"><i data-lucide="clock" class="w-3 h-3"></i>等待轉譯…</div>`;
+      } else {
+        const pct = r.progress.pct;
+        const el = r.progress.elapsed || "";
+        const caption = (pct != null ? `約 ${pct}%（估算）` : "轉譯中") + (el ? ` · 已 ${el}` : "");
+        badge = renderStatusBadge({ status:"info", text: pct != null ? `${pct}%` : "轉譯中" });
+        const bar = pct != null
+          ? `<div class="h-full bg-status-info transition-[width] duration-500" style="width:${pct}%"></div>`
+          : `<div class="h-full w-1/3 bg-status-info animate-pulse"></div>`;
+        progLine = `<div class="mt-1.5">
+            <div class="text-xs text-text-muted mb-1">${caption}</div>
+            <div class="h-1.5 rounded-full bg-bg-input overflow-hidden">${bar}</div>
+          </div>`;
+      }
+    } else {
+      badge = renderStatusBadge({ status: sm.s, text: sm.t });
+    }
+
     let actions = "";
     if (showActions) {
       const btns = [];
@@ -627,7 +662,8 @@
         btns.push(renderButton({ variant:"secondary", icon:"copy",                    size:"sm", onclick:`copyResult('${stem}')` }));
         btns.push(renderButton({ variant:"secondary", icon:"download",                size:"sm", onclick:`exportResult('${stem}')` }));
       } else if (r.status === "summarizing") {
-        btns.push(renderButton({ variant:"secondary", icon:"file-text", label:"逐字稿", size:"sm", onclick:`viewTranscript('${stem}')` }));
+        btns.push(renderButton({ variant:"primary",   icon:"sparkles",  label:"生成會議紀錄", size:"sm", onclick:`generateResult('${stem}')` }));
+        btns.push(renderButton({ variant:"secondary", icon:"file-text", label:"逐字稿",       size:"sm", onclick:`viewTranscript('${stem}')` }));
       }
       btns.push(renderButton({ variant:"ghost", icon:"trash-2", size:"sm", onclick:`deleteRecording('${id}')` }));
       actions = `<div class="flex items-center gap-1.5 flex-shrink-0">${btns.join("")}</div>`;
@@ -640,8 +676,9 @@
       <div class="flex-1 min-w-0">
         <div class="text-sm font-medium truncate">${esc(r.name)}</div>
         <div class="text-xs text-text-muted mt-0.5">${esc(r.duration)} · ${esc(r.size)} · ${esc(r.time)}</div>
+        ${progLine}
       </div>
-      ${renderStatusBadge({ status: sm.s, text: sm.t })}
+      ${badge}
       ${actions}
     </div>`;
   }
@@ -735,8 +772,15 @@
   }
 
   async function startService(key) {
-    const r = await callApi("start_service", key);
-    showToast(r?.message || "啟動指令已送出", "info");
+    // 用原始回應以便讀取依賴檢查的錯誤訊息（callApi 會把失敗吞成 null）
+    let r;
+    try { r = await window.pywebview.api.start_service(key); }
+    catch (e) { showToast("啟動服務失敗", "error"); return; }
+    if (r?.success) {
+      showToast(r.data?.message || "啟動指令已送出", "info");
+    } else {
+      showToast(r?.error?.message || "前置依賴未就緒，無法啟動此服務", "error");
+    }
     setTimeout(_refreshServices, 800);
   }
 
@@ -766,6 +810,42 @@
   }
 
   // ════════════════════════════════════════════
+  // 關閉流程（由 pywebview 的 closing 事件觸發 window.__confirmShutdown）
+  // ════════════════════════════════════════════
+
+  function confirmShutdown() {
+    if (document.getElementById("shutdown-overlay")) return;   // 已在關閉中
+    if (document.getElementById("confirm-modal-overlay")) return; // 已有彈窗
+    showConfirmModal({
+      icon:"power", iconBg:"background:#ff5c5c15", iconColor:"text-accent-primary",
+      title:"確認關閉程式", message:"關閉前會一併停止背景服務（Whisper / STT Worker / LLM / OpenClaw）。",
+      confirmLabel:"關閉程式", confirmVariant:"danger",
+      onConfirm: _doShutdown,
+    });
+  }
+
+  async function _doShutdown() {
+    // 全螢幕遮罩 + 轉圈，直到後端停完服務並關閉視窗
+    const ov = document.createElement("div");
+    ov.id = "shutdown-overlay";
+    ov.className = "fixed inset-0 z-[10000] flex flex-col items-center justify-center gap-4 bg-black/75 backdrop-blur-sm";
+    ov.innerHTML = `
+      <div class="w-12 h-12 rounded-full border-4 border-border-default border-t-accent-primary animate-spin"></div>
+      <div class="text-sm font-medium text-text-secondary">正在關閉服務…</div>
+      <div class="text-xs text-text-muted">停止背景服務後將自動關閉，請稍候</div>`;
+    document.body.appendChild(ov);
+    try {
+      // 後端停完所有服務後會 destroy 視窗；這個 await 通常不會 resolve
+      await window.pywebview.api.shutdown_app();
+    } catch (e) {
+      // 視窗已關或呼叫中斷，忽略
+    }
+  }
+
+  // 供 pywebview closing 事件（Python 端 evaluate_js）呼叫
+  window.__confirmShutdown = confirmShutdown;
+
+  // ════════════════════════════════════════════
   // 頁面渲染 — Settings
   // ════════════════════════════════════════════
 
@@ -787,11 +867,12 @@
     // API Keys
     renderInto("panel-set-api", renderSectionPanel({
       icon: "key", iconColor: "text-warn",
-      title: "API 金鑰", description: "Whisper 語音辨識與 Claude 摘要所需金鑰",
+      title: "API 金鑰 / Token", description: "LLM 整理服務所需的 Claude 訂閱 Token",
       children: `<div class="flex flex-col gap-4">
-        ${renderInput({ id:"whisper-key", label:"OpenAI Whisper API Key", icon:"key", type:"password", placeholder:"sk-...", value: keys.whisper ? "••••••••" : "", required:true })}
-        ${renderInput({ id:"claude-key",  label:"Claude API Key",         icon:"key", type:"password", placeholder:"sk-ant-...", value: keys.claude ? "••••••••" : "", required:true })}
-        <div class="mt-1">${renderButton({ variant:"primary", icon:"save", label:"儲存 API 金鑰", onclick:"saveApiKeys()" })}</div>
+        ${renderInput({ id:"claude-key",  label:"Claude 訂閱 Token", icon:"key-round", type:"password", placeholder:"claude setup-token 取得", value: keys.claude ? "••••••••" : "", required:true })}
+        <div class="text-xs text-text-muted -mt-2">LLM／OpenClaw 服務啟動的必要條件；未填則只做錄音與轉譯。</div>
+        ${renderInput({ id:"whisper-key", label:"Whisper API Key（選填，目前未使用）", icon:"key", type:"password", placeholder:"sk-...", value: keys.whisper ? "••••••••" : "" })}
+        <div class="mt-1">${renderButton({ variant:"primary", icon:"save", label:"儲存", onclick:"saveApiKeys()" })}</div>
       </div>`,
     }));
 
@@ -831,7 +912,7 @@
 
   async function startRecording() {
     if (!_canRecord) {
-      showToast("請先安裝並啟動 Docker Desktop 才能錄音", "error");
+      showToast(_envMessage || "尚未就緒，無法開始錄音", "error");
       return;
     }
     const result = await callApi("start_recording");
@@ -852,7 +933,14 @@
       onConfirm: async () => {
         const result = await callApi("stop_recording");
         if (result) {
-          showToast(`錄音完成：${result.filename}（${result.duration}）`, "success");
+          if (result.finalizing) {
+            showToast(`錄音已停止：${result.filename}，存檔中…`, "info");
+            // 檔案仍在背景續寫，稍後再刷新清單讓它出現
+            setTimeout(_refreshRecordingList, 3000);
+            setTimeout(_refreshRecordingList, 8000);
+          } else {
+            showToast(`錄音完成：${result.filename}（${result.duration}）`, "success");
+          }
           _lastRecState = null;            // 強制下次 tick 整段重繪回待機
           _tickRecording();
           _refreshRecordingList();
@@ -927,6 +1015,19 @@
     });
   }
 
+  async function generateResult(stem) {
+    // 用原始回應以便讀取錯誤訊息（沒 token / llm 沒起來等）
+    let r;
+    try { r = await window.pywebview.api.generate_result(stem); }
+    catch (e) { showToast("生成失敗", "error"); return; }
+    if (r?.success) {
+      showToast(r.data?.message || "正在生成會議紀錄…", "info");
+      _refreshRecordingList();   // 背景生成；清單會自動輪詢，完成後該筆變「完成」
+    } else {
+      showToast(r?.error?.message || "無法生成會議紀錄", "error");
+    }
+  }
+
   async function copyResult(stem) {
     const r = await callApi("get_result", stem);
     if (!r) { showToast("會議紀錄尚未生成", "warning"); return; }
@@ -955,13 +1056,11 @@
   }
 
   async function saveApiKeys() {
-    const w = document.getElementById("whisper-key")?.value?.trim();
-    const c = document.getElementById("claude-key")?.value?.trim();
-    if (!w || w === "••••••••" || !c || c === "••••••••") {
-      showToast("請填入真實的 API 金鑰", "warning"); return;
-    }
+    // 空字串或遮罩值不覆寫既有（後端 _keep 處理）；至少要有 Claude token 才有意義
+    const w = document.getElementById("whisper-key")?.value?.trim() || "";
+    const c = document.getElementById("claude-key")?.value?.trim() || "";
     const ok = await callApiOk("save_api_keys", w, c);
-    ok ? showToast("API 金鑰已儲存", "success") : showToast("儲存失敗", "error");
+    ok ? showToast("已儲存", "success") : showToast("儲存失敗", "error");
   }
 
   async function saveStorage() {
@@ -1003,6 +1102,8 @@
 
   let _canRecord = true;          // 樂觀預設，待 refreshEnvStatus 修正
   let _sttReady = false;          // 語音辨識引擎（whisper 容器）是否就緒
+  let _envMessage = "";           // 目前阻擋錄音的原因（白話）
+  let _envBlocker = "";           // 阻擋類別：docker_not_installed | docker_not_running | wsl | audio | services
   let _envInterval = null;
   let _healthInterval = null;
 
@@ -1011,20 +1112,29 @@
     if (!env) return;             // 後端不可用時不動 UI
     _canRecord = !!env.can_record;
     _sttReady = env.stt_status === "running";
+    _envMessage = env.message || "";
+    _envBlocker = env.blocker || "";
 
     const banner = document.getElementById("env-banner");
     if (banner) {
       if (env.message) {
         const isBlocking = !env.can_record;
-        const cls = isBlocking
-          ? "bg-status-error/10 border-status-error/40 text-status-error"
-          : "bg-warn/10 border-warn/40 text-warn";
-        const icon = isBlocking ? "alert-octagon" : "loader";
+        // 「服務啟動中」屬暫態（黃色 + loader），其餘阻擋為紅色
+        const transient = env.blocker === "services";
+        const cls = transient
+          ? "bg-warn/10 border-warn/40 text-warn"
+          : "bg-status-error/10 border-status-error/40 text-status-error";
+        const icon = transient ? "loader" : "alert-octagon";
+        // 只有「需安裝」類阻擋才給安裝連結
+        const installFor = {
+          docker_not_installed: "https://www.docker.com/products/docker-desktop/",
+          wsl: "https://learn.microsoft.com/windows/wsl/install",
+        }[env.blocker];
         banner.innerHTML = `
           <div class="flex items-center gap-3 px-4 py-3 rounded-md border ${cls}">
-            <i data-lucide="${icon}" class="w-5 h-5 flex-shrink-0"></i>
+            <i data-lucide="${icon}" class="w-5 h-5 flex-shrink-0 ${transient ? "animate-spin" : ""}"></i>
             <div class="flex-1 text-sm font-medium">${esc(env.message)}</div>
-            ${isBlocking ? `<a href="https://www.docker.com/products/docker-desktop/" target="_blank"
+            ${installFor ? `<a href="${installFor}" target="_blank"
                  class="text-xs font-semibold underline whitespace-nowrap">前往安裝</a>` : ""}
           </div>`;
         refreshIcons();
@@ -1064,8 +1174,19 @@
     const version = await callApi("get_app_version");
     if (version) document.getElementById("app-version").textContent = `v${version}`;
 
-    // 顯示主介面
     document.getElementById("app-loading").classList.add("hidden");
+
+    // 首次設定未完成 → 先讓使用者填錄音資料夾，按「完成設定」後才啟動服務
+    const setup = await callApi("get_setup_state");
+    if (setup && !setup.configured) {
+      showSetupScreen(setup);
+      return;
+    }
+    enterApp();
+  }
+
+  // 進入主介面（首次設定完成、或已設定過時呼叫）
+  function enterApp() {
     document.getElementById("app-main").classList.remove("hidden");
     document.getElementById("app-main").classList.add("flex");
 
@@ -1086,6 +1207,68 @@
     _refreshSidebarHealth();
     clearInterval(_healthInterval);
     _healthInterval = setInterval(_refreshSidebarHealth, 15000);
+  }
+
+  // ════════════════════════════════════════════
+  // 首次設定畫面（啟動服務前讓使用者填錄音資料夾）
+  // ════════════════════════════════════════════
+
+  function showSetupScreen(setup) {
+    const ov = document.createElement("div");
+    ov.id = "setup-overlay";
+    ov.className = "fixed inset-0 z-[9500] flex items-center justify-center bg-bg-base p-6";
+    ov.innerHTML = `
+      <div class="bg-bg-card border border-border-strong rounded-md w-[480px] flex flex-col gap-5" style="padding:32px">
+        <div class="flex items-center gap-3">
+          <div class="w-11 h-11 rounded-full flex items-center justify-center" style="background:#ff5c5c15">
+            <i data-lucide="folder-cog" class="w-6 h-6 text-accent-primary"></i>
+          </div>
+          <div>
+            <div class="text-lg font-bold">首次設定</div>
+            <div class="text-xs text-text-muted">完成後才會啟動背景服務</div>
+          </div>
+        </div>
+        <div class="text-[13px] text-text-secondary leading-relaxed">
+          請選擇<strong class="text-text-primary">錄音檔的儲存資料夾</strong>。留空則使用預設位置：<br>
+          <span class="text-xs text-text-muted font-mono">${esc(setup.default_recordings_dir || "")}</span>
+        </div>
+        <div class="flex gap-2 items-end">
+          <div class="flex-1">${renderInput({ id:"setup-folder", label:"錄音資料夾", icon:"folder", placeholder:"例如 D:\\record（可留空用預設）", value: setup.local_path || "" })}</div>
+          <button onclick="_setupBrowse()" class="inline-flex items-center justify-center gap-1.5 font-medium rounded-sm px-3 py-2.5 text-sm bg-bg-card text-text-secondary border border-border-default hover:bg-bg-input transition-colors cursor-pointer whitespace-nowrap"><i data-lucide="folder-open" class="w-4 h-4"></i>瀏覽</button>
+        </div>
+        ${renderInput({ id:"setup-token", label:"Claude 訂閱 Token", icon:"key-round", type:"password", placeholder:"claude setup-token 取得（可留空）" })}
+        <div class="text-xs text-text-muted -mt-2 leading-relaxed">
+          用於 LLM 整理逐字稿。<strong>留空也能用</strong>——錄音與轉譯照常運作，只是不會自動生成會議紀錄；日後可在「設定」補填。
+        </div>
+        <button id="setup-start" onclick="_setupComplete()" class="w-full inline-flex items-center justify-center gap-2 font-medium rounded-sm px-4 py-3 text-sm bg-accent-primary text-white hover:bg-[#e64d4d] transition-colors cursor-pointer">
+          <i data-lucide="rocket" class="w-4 h-4"></i><span>完成設定並啟動服務</span>
+        </button>
+      </div>`;
+    document.body.appendChild(ov);
+    refreshIcons();
+  }
+
+  async function _setupBrowse() {
+    const p = await callApi("pick_folder");
+    if (p) document.getElementById("setup-folder").value = p;
+  }
+
+  async function _setupComplete() {
+    const btn = document.getElementById("setup-start");
+    const path = document.getElementById("setup-folder").value.trim();
+    const token = document.getElementById("setup-token").value.trim();
+    btn.disabled = true;
+    btn.innerHTML = `<div class="w-4 h-4 rounded-full border-2 border-white/40 border-t-white animate-spin"></div><span>啟動中…</span>`;
+    const ok = await callApiOk("complete_setup", path, token);
+    if (!ok) {
+      showToast("設定失敗，請重試", "error");
+      btn.disabled = false;
+      btn.innerHTML = `<i data-lucide="rocket" class="w-4 h-4"></i><span>完成設定並啟動服務</span>`;
+      refreshIcons();
+      return;
+    }
+    document.getElementById("setup-overlay")?.remove();
+    enterApp();
   }
 
   // PyWebView 就緒後啟動

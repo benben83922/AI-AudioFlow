@@ -17,10 +17,15 @@ from src.bridge._helpers import _ok
 
 logger = logging.getLogger(__name__)
 
-WORKER_LOCK_PORT = 47654          # 與 worker.py 的 STT_LOCK_PORT 預設一致
+WORKER_LOCK_PORT = 47654          # 與 worker_main.py 的 STT_LOCK_PORT 預設一致
 DEFAULT_WHISPER_URL = "http://localhost:9000"
 DEFAULT_LANGUAGE = "zh"
 _CREATE_NO_WINDOW = 0x08000000    # Windows：不閃主控台視窗
+
+
+def _is_frozen() -> bool:
+    """是否為打包後（Nuitka / PyInstaller）執行；決定如何重新拉起 worker。"""
+    return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
 def _worker_running(port: int = WORKER_LOCK_PORT, pid_file: "Path | None" = None) -> bool:
@@ -106,18 +111,32 @@ class WorkerMixin:
         storage = config.get("storage", {})
 
         watch_dir = storage.get("local_path", "").strip() or str(self._recordings_dir)
-        outbox_dir = storage.get("transcripts_path", "").strip()
+        # 逐字稿輸出資料夾：吃 _base 的解析（未設定時依裝置自動偵測 WSL stt-outbox）
+        outbox = self._transcripts_dir_path()
 
         env = dict(os.environ)
         env["STT_WATCH_DIR"] = watch_dir
-        if outbox_dir:
-            env["STT_OUTBOX_DIR"] = outbox_dir
+        if outbox is not None:
+            env["STT_OUTBOX_DIR"] = str(outbox)
         env["WHISPER_URL"] = storage.get("whisper_url", "").strip() or DEFAULT_WHISPER_URL
         env["STT_LANGUAGE"] = DEFAULT_LANGUAGE
         env["STT_LOCK_PORT"] = str(WORKER_LOCK_PORT)
-        # detached 程序沒有主控台，logging 導向檔案方便查看
-        env["STT_LOG_FILE"] = str(self._project_root / "stt-worker" / "worker.log")
+        # CPU 轉譯長錄音可能超過預設 600s，放寬逾時避免長檔轉到一半被砍（可被環境變數覆寫）
+        env.setdefault("STT_REQUEST_TIMEOUT", "1800")
+        # detached 程序沒有主控台，logging 導向檔案方便查看（打包後寫在 exe 同層）
+        env["STT_LOG_FILE"] = str(getattr(self, "_data_root", self._project_root) / "worker.log")
         return env
+
+    def _worker_launch_cmd(self) -> list[str]:
+        """組出拉起 worker 的指令（內嵌 worker 模式）。
+
+        打包後：主 exe 重新拉起自己 → `app.exe --worker`。
+        原始碼：以模組方式跑 → `python -m src.main --worker`。
+        兩者最終都會執行 src/worker_main.py:main()。
+        """
+        if _is_frozen():
+            return [sys.executable, "--worker"]
+        return [sys.executable, "-m", "src.main", "--worker"]
 
     def start_worker_detached(self) -> None:
         """若 worker 尚未在跑，以 detached 程序拉起（關閉 app 後仍持續）。"""
@@ -125,13 +144,8 @@ class WorkerMixin:
             logger.info("STT worker 已在執行，略過啟動")
             return
 
-        worker_path = self._project_root / "stt-worker" / "worker.py"
-        if not worker_path.exists():
-            logger.error("找不到 worker：%s", worker_path)
-            return
-
         kwargs: dict = {
-            "cwd": str(worker_path.parent),
+            "cwd": str(self._project_root),  # 供原始碼模式解析 `-m src.main`
             "env": self._worker_env(),
             "stdin": subprocess.DEVNULL,
             "stdout": subprocess.DEVNULL,
@@ -145,7 +159,7 @@ class WorkerMixin:
             kwargs["start_new_session"] = True
 
         try:
-            proc = subprocess.Popen([sys.executable, str(worker_path)], **kwargs)
+            proc = subprocess.Popen(self._worker_launch_cmd(), **kwargs)
             # 寫 pidfile 供 stop_worker 終止（detached 程序跨 app 重啟仍可被收掉）
             try:
                 self._worker_pid_file().write_text(str(proc.pid), encoding="utf-8")

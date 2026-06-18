@@ -34,6 +34,10 @@ COMPOSE_SVC = {"llm_service": "llm-service", "openclaw": "openclaw"}
 # 啟動順序（whisper / worker 先就緒，再起下游 compose）
 SERVICE_ORDER = ("whisper", "stt_worker", "llm_service", "openclaw")
 
+# 「系統就緒」只看核心服務（錄音→逐字稿）。LLM／openclaw 需使用者填 Claude token
+# 才會啟動，未填屬正常狀態，不應讓整體健康卡在「未就緒」，故不納入核心。
+CORE_SERVICES = ("whisper", "stt_worker")
+
 SERVICE_META = {
     "whisper":     {"name": "Whisper 語音引擎", "desc": "本地語音轉文字容器（port 9000）"},
     "stt_worker":  {"name": "STT Worker",       "desc": "監看錄音資料夾並送轉譯"},
@@ -49,6 +53,7 @@ class ServicesMixin:
 
     _compose_lock = threading.Lock()
     _services_cache: tuple[float, dict] | None = None  # (時間, status dict)
+    _shutting_down = False  # 關閉流程已確認 → 放行視窗關閉
 
     # ── docker compose 執行（Windows 走 WSL）──
 
@@ -61,9 +66,14 @@ class ServicesMixin:
 
     def _run_compose(self, args: list[str], timeout: float = 600) -> subprocess.CompletedProcess:
         """在專案根目錄執行 docker compose；Windows 透過 WSL（compose 檔用 WSL 路徑）。"""
+        # compose 內容（docker-compose.yml + 各 build context）位於 _data_root：
+        # 原始碼 = 專案根；打包後 = exe 同層（發佈時一併放置）
+        compose_root = getattr(self, "_data_root", self._project_root)
         if sys.platform == "win32":
-            wsl_root = self._to_wsl_path(self._project_root)
-            inner = "cd {} && docker compose {}".format(
+            wsl_root = self._to_wsl_path(compose_root)
+            # 在 WSL login shell 內執行：$HOME / uid / gid 皆由當前裝置自動帶出，
+            # 供 compose 內插（掛載路徑 ${HOME}/... 與 ${HOST_UID}/${HOST_GID}）
+            inner = "cd {} && export HOST_UID=$(id -u) HOST_GID=$(id -g) && docker compose {}".format(
                 shlex.quote(wsl_root),
                 " ".join(shlex.quote(a) for a in args),
             )
@@ -71,7 +81,10 @@ class ServicesMixin:
             kwargs = {"creationflags": _CREATE_NO_WINDOW}
         else:
             cmd = ["docker", "compose", *args]
-            kwargs = {"cwd": str(self._project_root)}
+            env = dict(os.environ)
+            env.setdefault("HOST_UID", str(os.getuid()))
+            env.setdefault("HOST_GID", str(os.getgid()))
+            kwargs = {"cwd": str(compose_root), "env": env}
         return subprocess.run(cmd, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=timeout, **kwargs)
 
@@ -109,8 +122,42 @@ class ServicesMixin:
     def _compose_running(self, svc: str) -> bool:
         return self._compose_status_all().get(svc, False)
 
+    def _claude_token(self) -> str:
+        return self._load_config().get("api_keys", {}).get("claude", "").strip()
+
+    def _sync_claude_token_env(self) -> None:
+        """讓 .env 的 CLAUDE_CODE_OAUTH_TOKEN 與設定一致（供 docker compose 自動載入）。
+
+        - 設定有 token → 寫入/更新該行（保留 .env 其他行）。
+        - 設定清空 token → 移除該行（避免殘留舊 token）。
+        """
+        token = self._claude_token()
+        env_path = getattr(self, "_data_root", self._project_root) / ".env"
+
+        existing = []
+        if env_path.exists():
+            try:
+                existing = env_path.read_text(encoding="utf-8").splitlines()
+            except Exception as e:
+                logger.warning("讀取 .env 失敗：%s", e)
+                existing = []
+
+        # 先移除舊的 token 行，再視情況補上新的
+        lines = [l for l in existing if not l.strip().startswith("CLAUDE_CODE_OAUTH_TOKEN=")]
+        if token:
+            lines.append(f"CLAUDE_CODE_OAUTH_TOKEN={token}")
+
+        # token 為空、且 .env 本來就不存在 → 不要憑空建立空檔
+        if not lines and not env_path.exists():
+            return
+        try:
+            env_path.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+        except Exception as e:
+            logger.error("寫入 .env 失敗：%s", e)
+
     def _compose_up(self, svc: str) -> None:
         """啟動單一 compose 服務（先判斷是否已在跑）。串行化避免並行 up。"""
+        self._sync_claude_token_env()   # 起 compose 前確保 token 已寫入 .env
         with self._compose_lock:
             if self._compose_running(svc):
                 logger.info("compose 服務 %s 已在執行，略過啟動", svc)
@@ -201,20 +248,31 @@ class ServicesMixin:
         services = list(status.values())
         running = sum(1 for s in services if s["running"])
         total = len(services)
-        transient = [s for s in services if s["status"] in ("starting", "pulling")]
-        errored = [s for s in services if s["status"] == "error"]
 
-        if errored:
-            # Docker 沒就緒會讓全部變 error，優先回報那一句
-            level, message = "attention", errored[0].get("message") or "部分服務異常，請檢查 Docker"
-        elif running == total:
-            level, message = "ready", "系統就緒，可開始錄音"
-        elif transient:
-            names = "、".join(s["name"] for s in transient)
+        # 「就緒」只看核心服務（whisper + worker）；LLM／openclaw 需 token 才啟動，
+        # 未填 token 時它們未啟動屬正常，不應拖累整體健康。
+        core = [status[k] for k in CORE_SERVICES if k in status]
+        core_errored = [s for s in core if s["status"] == "error"]
+        core_transient = [s for s in core if s["status"] in ("starting", "pulling")]
+        core_stopped = [s for s in core if not s["running"]]
+
+        if core_errored:
+            # Docker 沒就緒會讓核心服務變 error，優先回報那一句
+            level, message = "attention", core_errored[0].get("message") or "核心服務異常，請檢查 Docker"
+        elif not core_stopped:
+            # 核心都在跑 → 就緒；若 LLM／openclaw 未跑，附註提醒（不影響可錄音）
+            down_extra = [s["name"] for s in services
+                          if s["key"] not in CORE_SERVICES and not s["running"]]
+            if down_extra:
+                message = "可錄音；" + "、".join(down_extra) + " 未啟動（需填 Claude Token）"
+            else:
+                message = "系統就緒，可開始錄音"
+            level = "ready"
+        elif core_transient:
+            names = "、".join(s["name"] for s in core_transient)
             level, message = "starting", f"{names} 啟動中…"
         else:
-            stopped = [s for s in services if not s["running"]]
-            names = "、".join(s["name"] for s in stopped)
+            names = "、".join(s["name"] for s in core_stopped)
             level, message = "attention", f"{names} 未啟動"
 
         return _ok({
@@ -224,9 +282,40 @@ class ServicesMixin:
             "total": total,
         })
 
+    def _service_deps_ok(self, key: str) -> tuple[bool, str]:
+        """啟動某服務前，檢查其前置依賴是否就緒。回傳 (ok, message)。
+
+        - whisper / llm_service / openclaw：需 Docker 已安裝且執行中。
+        - llm_service / openclaw（compose 服務）：Windows 下另需 WSL 就緒。
+        - stt_worker：無硬性前置依賴（可獨立拉起；轉譯需 whisper，但不擋啟動）。
+        """
+        if key == "stt_worker":
+            return True, ""
+
+        d_state, dmsg = self._docker_state()
+        if d_state == "not_installed":
+            return False, "尚未安裝 Docker Desktop，無法啟動此服務"
+        if d_state != "ok":
+            return False, dmsg or "請先啟動 Docker Desktop"
+
+        if key in ("llm_service", "openclaw"):
+            w_state, wmsg = self._wsl_state()
+            if w_state != "ok":
+                return False, wmsg or "WSL 未就緒，無法啟動此服務"
+            # LLM 需 Claude 訂閱 token；openclaw 依賴 LLM，故同樣需要
+            if not self._claude_token():
+                return False, "請先在設定填入 Claude 訂閱 Token（claude setup-token）才能啟動 LLM／OpenClaw"
+
+        return True, ""
+
     def start_service(self, key: str) -> dict:
         if key not in SERVICE_META:
             return _err(ErrorType.VALIDATION, f"未知服務：{key}")
+
+        ok, msg = self._service_deps_ok(key)
+        if not ok:
+            return _err(ErrorType.DOCKER_UNAVAILABLE, msg)
+
         self.__class__._services_cache = None
 
         if key == "whisper":
@@ -281,3 +370,54 @@ class ServicesMixin:
                 except Exception as e:
                     logger.error("啟動 %s 失敗：%s", key, e)
         threading.Thread(target=_run, name="services-startup", daemon=True).start()
+
+    # ── 關閉生命週期 ──
+
+    def on_window_closing(self, *args) -> bool:
+        """pywebview 視窗關閉事件處理（*args 容忍不同版本的呼叫慣例）。
+
+        首次關閉：取消這次關閉（回傳 False），改叫前端跳「確認關閉」彈窗。
+        確認後 shutdown_app() 會設 _shutting_down 並停服務、再 destroy →
+        destroy 觸發的這次事件就放行（回傳 True）。
+        """
+        if self.__class__._shutting_down:
+            return True
+        try:
+            if self._window:
+                self._window.evaluate_js("window.__confirmShutdown && window.__confirmShutdown()")
+        except Exception as e:
+            logger.warning("呼叫前端確認關閉失敗：%s", e)
+        return False  # 取消本次關閉，等使用者於彈窗確認
+
+    def stop_all_services_sync(self) -> None:
+        """同步停止全部背景服務並等待完成（關閉流程用，期間前端顯示轉圈）。"""
+        try:
+            self.stop_worker()
+        except Exception as e:
+            logger.error("停止 STT worker 失敗：%s", e)
+        try:
+            self.stop_stt_container()
+        except Exception as e:
+            logger.error("停止 whisper 容器失敗：%s", e)
+        # 一次停掉所有 compose 服務（llm-service / openclaw），阻塞至完成
+        try:
+            with self._compose_lock:
+                self._run_compose(["stop"], timeout=180)
+        except Exception as e:
+            logger.error("停止 compose 服務失敗：%s", e)
+        self.__class__._services_cache = None
+
+    def shutdown_app(self) -> dict:
+        """前端確認關閉後呼叫：停掉所有服務，完成後關閉主視窗。"""
+        self.__class__._shutting_down = True
+        logger.info("關閉中：停止所有背景服務…")
+        try:
+            self.stop_all_services_sync()
+        finally:
+            logger.info("服務已停止，關閉視窗")
+            if self._window:
+                try:
+                    self._window.destroy()
+                except Exception as e:
+                    logger.error("關閉視窗失敗：%s", e)
+        return _ok({"message": "已關閉"})

@@ -10,11 +10,16 @@ services:
     build: ./llm-service
     # 以非 root 的 node 使用者執行（claude 拒絕用 root 跑 --dangerously-skip-permissions）
     user: "node"
+    # 只綁本機 localhost：讓桌面 app 也能直接呼叫 LLM 整理逐字稿（不靠 openclaw）。
+    # 綁 127.0.0.1 而非 0.0.0.0，避免對外網裸開。openclaw 仍走 docker network 容器名連線。
+    ports:
+      - "127.0.0.1:8088:8088"
     environment:
-      # 訂閱 token：在你本機跑 `claude setup-token`，把結果放進專案根目錄的 .env：
-      #   CLAUDE_CODE_OAUTH_TOKEN=...
-      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:?請在 .env 設定 CLAUDE_CODE_OAUTH_TOKEN（claude setup-token 取得）}
+      # 訂閱 token：由 app 前端設定填入 → 後端把關（沒填就不啟動 LLM）並寫進 .env。
+      # 這裡用 :- 預設空字串（而非 :? 強制），讓 compose ps/status 在未填 token 時也不報錯。
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
       CLAUDE_MODEL: ${CLAUDE_MODEL:-opus}
+      CLAUDE_TIMEOUT_MS: ${CLAUDE_TIMEOUT_MS:-600000}  # claude -p 逾時（毫秒），逾時即殺
       HOME: /home/node          # claude 的設定 / 快取目錄
     restart: unless-stopped
     networks: [audioflow]
@@ -32,7 +37,7 @@ services:
     image: busybox
     user: root
     volumes:
-      - /home/benben83922/openclaw-out:/out        # 整理結果輸出目錄（需可寫）
+      - ${HOME}/openclaw-out:/out        # 整理結果輸出目錄（需可寫）；$HOME 依當前裝置自動帶出
     command: sh -c "chown -R ${HOST_UID:-1000}:${HOST_GID:-1000} /out"
     restart: "no"
 
@@ -46,8 +51,8 @@ services:
       LLM_MODEL: ${CLAUDE_MODEL:-opus}
       POLL_INTERVAL: "10"
     volumes:
-      - /home/benben83922/stt-outbox:/in:ro        # 逐字稿，唯讀（最小權限）
-      - /home/benben83922/openclaw-out:/out        # 整理結果，可寫
+      - ${HOME}/stt-outbox:/in:ro        # 逐字稿，唯讀（最小權限）；$HOME 依當前裝置自動帶出
+      - ${HOME}/openclaw-out:/out        # 整理結果，可寫
     depends_on:
       llm-service:
         condition: service_healthy               # 等 LLM 服務健康才啟動

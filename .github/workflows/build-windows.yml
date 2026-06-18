@@ -1,0 +1,47 @@
+name: Build Windows EXE
+
+# 觸發方式：
+#   - 手動：到 GitHub 的 Actions 分頁按「Run workflow」
+#   - 打版本 tag（v1.0.0 之類）時自動 build
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest          # 乾淨的雲端 Windows，無 Acronis/防毒干擾
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -e ".[build]"
+
+      - name: Build single exe (Nuitka onefile)
+        shell: cmd
+        run: |
+          python scripts\gen_bundled_assets.py
+          python -m nuitka ^
+            --standalone --onefile --assume-yes-for-downloads ^
+            --windows-console-mode=disable ^
+            --company-name=AudioFlow --product-name="AI AudioFlow" ^
+            --file-version=0.1.0 --product-version=0.1.0 ^
+            --include-package=src ^
+            --include-data-dir=src/frontend=src/frontend ^
+            --output-dir=dist --output-filename=AudioFlow.exe ^
+            app.py
+
+      - name: Upload exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AudioFlow-exe
+          path: dist/AudioFlow.exe
+          if-no-files-found: error     # build 失敗（無 exe）就讓任務紅燈

@@ -16,8 +16,18 @@ from src.bridge._helpers import _ok
 logger = logging.getLogger(__name__)
 
 STT_CONTAINER = "whisper-stt-server"
-STT_IMAGE = "hwdsl2/whisper-server"        # CPU image；TODO: 之後 pin 具體版本
+# 此 image 只有滾動 tag（latest / latest-amd64 / cuda），沒有版本號可釘，
+# 因此 pin「digest」鎖定不可變的確切 image（供應鏈最穩）。
+# 這是 2026-06-18 latest 的 manifest digest（多架構，docker 會挑 amd64）。
+# 要更新版本：重查 Docker Hub 取新 digest 後替換此常數。
+STT_IMAGE = "hwdsl2/whisper-server@sha256:008ef78e8164be1a52d3c16a0a4702af4190bc355c057e481ceb35af739ab184"
 STT_PORT = 9000
+
+_CREATE_NO_WINDOW = 0x08000000             # Windows：不閃主控台視窗
+
+# 錄音「當下」真正需要就緒的服務：whisper（轉譯引擎）+ STT worker（送轉譯）。
+# llm-service / openclaw 是逐字稿之後的下游，不擋錄音（晚點補跑即可）。
+RECORD_REQUIRED_SERVICES = ("whisper", "stt_worker")
 
 
 def _popen_kwargs() -> dict:
@@ -46,6 +56,44 @@ class DockerMixin:
 
     # docker 狀態快取（避免頻繁輪詢 hammer docker CLI）
     _docker_cache: tuple[float, str, str] | None = None  # (時間, state, message)
+    _wsl_cache: tuple[float, str, str] | None = None     # (時間, state, message)
+
+    # ── 前置依賴偵測（Docker / WSL）──
+
+    def _wsl_state(self) -> tuple[str, str]:
+        """回傳 (state, message)。state: ok | not_installed | no_distro | error。
+
+        僅 Windows 需要 WSL（compose 服務透過 WSL 執行）；非 Windows 一律視為 ok。
+        """
+        if sys.platform != "win32":
+            return "ok", ""
+
+        now = time.time()
+        if self._wsl_cache and now - self._wsl_cache[0] < 5.0:
+            return self._wsl_cache[1], self._wsl_cache[2]
+
+        try:
+            r = subprocess.run(
+                ["wsl", "-l", "-q"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=10, creationflags=_CREATE_NO_WINDOW,
+            )
+        except FileNotFoundError:
+            state, msg = "not_installed", "找不到 WSL，請先安裝 WSL2（wsl --install）"
+        except Exception as e:
+            state, msg = "error", f"WSL 無法連線：{e}"
+        else:
+            # wsl -l -q 在 Windows 輸出 UTF-16，errors=replace 後會夾雜空字元，去掉再判斷
+            distros = [d.strip() for d in (r.stdout or "").replace("\x00", "").splitlines() if d.strip()]
+            if r.returncode != 0:
+                state, msg = "not_installed", "WSL 未就緒，請確認已安裝並設定預設發行版"
+            elif not distros:
+                state, msg = "no_distro", "WSL 尚未安裝任何發行版（需 Ubuntu 等）"
+            else:
+                state, msg = "ok", ""
+
+        self.__class__._wsl_cache = (now, state, msg)
+        return state, msg
 
     # ── Docker 偵測 ──
 
@@ -178,33 +226,62 @@ class DockerMixin:
     # ── Public API ──
 
     def get_environment_status(self) -> dict:
-        """提供前端：Docker / STT 狀態與是否可錄音。"""
-        state, dmsg = self._docker_state()
-        docker_installed = state != "not_installed"
-        docker_running = state == "ok"
+        """提供前端：完整錄音就緒判斷。
+
+        錄音門檻（皆需滿足才可錄）：
+            1. Docker Desktop 已安裝且執行中
+            2.（Windows）WSL 就緒
+            3. 有可用的音訊輸入裝置（麥克風或系統音 loopback）
+            4. 四個背景服務全部 running
+        任一不滿足 → can_record=False，並回傳第一個阻擋原因（blocker + message）。
+        """
+        d_state, dmsg = self._docker_state()
+        docker_installed = d_state != "not_installed"
+        docker_running = d_state == "ok"
+
+        w_state, wmsg = self._wsl_state()
+        wsl_ok = w_state == "ok"
+
+        audio_ok, amsg = self._audio_input_available()
 
         # Docker 已就緒但容器還沒起來（例如使用者啟動後才開 Docker Desktop）→ 背景重試
         if docker_running and self._stt_status in ("unknown", "error"):
             self.start_stt_async()
 
-        # 規格：沒安裝 Docker Desktop 就不給錄音
-        can_record = docker_installed
+        # 依賴就緒才有意義去看「錄音所需服務是否啟動」
+        deps_ok = docker_running and wsl_ok
+        services_ready = False
+        not_running = []
+        if deps_ok:
+            services = self.get_services_status()["data"]
+            required = [services[k] for k in RECORD_REQUIRED_SERVICES if k in services]
+            services_ready = all(s["running"] for s in required)
+            not_running = [s["name"] for s in required if not s["running"]]
 
-        if state == "not_installed":
-            message = "尚未偵測到 Docker Desktop，請先安裝後再使用錄音功能"
-        elif state == "not_running":
-            message = dmsg  # 已安裝但未啟動
-        elif self._stt_status in ("pulling", "starting"):
-            message = self._stt_message or "STT 服務啟動中…"
-        elif self._stt_status == "error":
-            message = self._stt_message or "STT 服務啟動失敗"
+        # 依優先序找出第一個阻擋原因
+        if not docker_installed:
+            blocker, message = "docker_not_installed", "尚未安裝 Docker Desktop，請先安裝後再使用錄音"
+        elif not docker_running:
+            blocker, message = "docker_not_running", dmsg or "請先啟動 Docker Desktop"
+        elif not wsl_ok:
+            blocker, message = "wsl", wmsg or "WSL 未就緒"
+        elif not audio_ok:
+            blocker, message = "audio", amsg or "找不到可用的音訊輸入裝置"
+        elif not services_ready:
+            blocker, message = "services", "服務啟動中或未就緒：" + "、".join(not_running)
         else:
-            message = ""
+            blocker, message = "", ""
+
+        can_record = deps_ok and audio_ok and services_ready
 
         return _ok({
             "docker_installed": docker_installed,
             "docker_running": docker_running,
+            "wsl_ok": wsl_ok,
+            "audio_available": audio_ok,
             "stt_status": self._stt_status,
+            "services_ready": services_ready,
             "can_record": can_record,
+            "blocker": blocker,
             "message": message,
         })
