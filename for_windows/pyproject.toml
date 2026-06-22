@@ -1,0 +1,36 @@
+[project]
+name = "ai-audioflow-windows"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "AI AudioFlow（純 Windows 版）— 本機錄音、faster-whisper 轉譯、claude -p 整理"
+
+dependencies = [
+    "pywebview>=5.0",
+    "sounddevice>=0.5",
+    "soundfile>=0.12",
+    "numpy>=1.24",
+    "faster-whisper>=1.0",
+    "pyaudiowpatch>=0.2; sys_platform == 'win32'",
+    "pythonnet>=3.0; sys_platform == 'win32'",
+    "clr_loader>=0.2; sys_platform == 'win32'",
+    "PyGObject>=3.42; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+build = [
+    # 必須釘 2.4.x 線：2.8.x / 4.x 會撞 Nuitka 內部 bug
+    # `assert micro_passes == 0`（optimizeModules 階段崩潰）。
+    "nuitka[onefile]==2.4.11",
+    "ordered-set>=4.0",
+    "setuptools<81",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["src", "src.bridge"]

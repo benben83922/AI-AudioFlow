@@ -1,0 +1,21 @@
+# 執行時產生的資料與快取（純 Windows 版）
+config.json
+worker.log
+worker.pid
+recordings/
+transcripts/
+results/
+models/
+
+# 建置 / 除錯產物
+build.log
+nuitka-crash-report.xml
+_run_worker_debug.bat
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/

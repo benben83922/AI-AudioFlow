@@ -1,0 +1,20 @@
+{
+  "setup_done": false,
+  "api_keys": {
+    "claude": ""
+  },
+  "storage": {
+    "local_path": "",
+    "transcripts_path": "",
+    "results_path": ""
+  },
+  "stt": {
+    "model": "large-v3-turbo",
+    "device": "cpu",
+    "compute_type": "int8",
+    "language": "zh"
+  },
+  "llm": {
+    "model": "opus"
+  }
+}
