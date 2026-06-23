@@ -1,5 +1,14 @@
 {
   "setup_done": false,
+  "pipeline": {
+    "mode": "auto",
+    "auto": false
+  },
+  "stt": {
+    "model": "large-v3-turbo",
+    "device": "cpu",
+    "compute_type": "int8"
+  },
   "api_keys": {
     "whisper": "",
     "claude": ""

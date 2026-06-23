@@ -2,12 +2,15 @@ import os
 import sys
 import json
 import time
+import shutil
 import threading
+import subprocess
 import logging
 from datetime import datetime
 from pathlib import Path
 
 from src.bridge._helpers import _ok, _err, ErrorType
+from src.bridge._platform import detect_platform, WINDOWS
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +76,48 @@ def _calc_level(arr) -> float:
         return 0.0
     rms = float(np.sqrt(np.mean(a ** 2)))
     return min(1.0, rms * 15.0)
+
+# ── PulseAudio 來源偵測（供 parec 擷取用；WSLg / 一般 Linux 桌面通用）──
+# 系統音 = 預設 sink 的 .monitor（等同 Windows 的 WASAPI loopback）；麥克風 = 預設 source。
+# 註：sounddevice/PortAudio 直開 monitor 在 WSLg 會卡死，故 Linux 改用 PulseAudio 原生 parec。
+
+def _pactl(*args) -> str:
+    try:
+        r = subprocess.run(["pactl", *args], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=5)
+        return (r.stdout or "").strip() if r.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _pulse_default_source() -> str | None:
+    return _pactl("get-default-source") or None
+
+
+def _pulse_monitor_source() -> str | None:
+    sink = _pactl("get-default-sink")
+    if sink:
+        return f"{sink}.monitor"
+    for line in _pactl("list", "short", "sources").splitlines():   # 後備：找任一 .monitor
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].endswith(".monitor"):
+            return parts[1]
+    return None
+
+
+# 列出 recordings 夾中有「轉逐字稿」請求標記的 stem（app 寫入、worker 取走轉譯）
+def _request_stems(dir_) -> set[str]:
+    out: set[str] = set()
+    suffix = ".transcribe.request"
+    try:
+        for p in Path(dir_).iterdir():
+            n = p.name
+            if n.startswith(".") and n.endswith(suffix):
+                out.add(n[1:-len(suffix)])
+    except Exception:
+        pass
+    return out
+
 
 # 列出資料夾內某副檔名的所有檔名主幹（stem）；資料夾不存在 / 不可讀回空集合
 def _stems_in(dir_, ext: str) -> set[str]:
@@ -170,25 +215,42 @@ class RecordingMixin:
             "level": round(self._recording_level, 3) if is_recording else 0.0,
         })
 
-    def start_recording(self) -> dict:
+    @staticmethod
+    def _safe_filename_part(s: str) -> str:
+        """清掉檔名不合法 / 路徑穿越字元（供會議主題、日期組檔名用）。"""
+        s = (s or "").strip()
+        for ch in '/\\:*?"<>|\n\r\t':
+            s = s.replace(ch, "")
+        return s.replace("..", "").strip()
+
+    def _build_recording_stem(self, topic: str, date: str, recordings_dir: Path) -> str:
+        """以「會議主題_日期」組檔名主幹；主題空→『錄音』、日期空→今日；碰撞加時間後綴。"""
+        topic = self._safe_filename_part(topic) or "錄音"
+        date = self._safe_filename_part(date) or datetime.now().strftime("%Y-%m-%d")
+        base = f"{topic}_{date}"
+        if (recordings_dir / f"{base}.wav").exists():        # 同主題同日再錄 → 不覆蓋
+            base = f"{base}_{datetime.now().strftime('%H%M%S')}"
+        return base
+
+    def start_recording(self, topic: str = "", date: str = "") -> dict:
         if self._recording_thread and self._recording_thread.is_alive():
             return _err(ErrorType.RECORDING_ACTIVE, "錄音已在進行中")
 
-        # 沒裝 Docker Desktop 就不給錄（無法轉譯，錄了也沒下文）
+        # 環境未就緒就不給錄（依平台/模式：Docker 或音訊裝置等）
         env = self.get_environment_status()["data"]
         if not env["can_record"]:
-            return _err(ErrorType.DOCKER_UNAVAILABLE, env["message"] or "請先安裝 Docker Desktop")
+            return _err(ErrorType.DOCKER_UNAVAILABLE, env["message"] or "尚未就緒，無法開始錄音")
 
         config = self._load_config()
         local_path = config["storage"].get("local_path", "").strip()
         recordings_dir = Path(local_path) if local_path else self._recordings_dir
         recordings_dir.mkdir(parents=True, exist_ok=True)
 
-        ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
-        filename = f"recording_{ts}.wav"
+        # 檔名 = 會議主題_日期（worker 取檔只略過 .part / 點開頭檔，自訂檔名照收）
+        stem = self._build_recording_stem(topic, date, recordings_dir)
+        filename = f"{stem}.wav"
         filepath = recordings_dir / filename
-        # 暫存名（與最終檔同資料夾，確保 os.replace 為原子操作）；
-        # 取檔端（STT worker）的輪詢需略過 .part / 點開頭檔，只收 recording_*.wav
+        # 暫存名（與最終檔同資料夾，確保 os.replace 為原子操作）
         tmp_path = recordings_dir / f".{filename}.part"
 
         self._recording_stop_event = threading.Event()
@@ -203,9 +265,11 @@ class RecordingMixin:
 
                 SAMPLERATE = 44100
 
-                if sys.platform == "win32":
+                plat = detect_platform()
+                if plat == WINDOWS:
                     audio = _record_windows(SAMPLERATE)
                 else:
+                    # WSL 與純 Linux 皆走 PulseAudio parec（系統音 monitor + 麥克風混音）
                     audio = _record_linux(SAMPLERATE)
 
                 if audio is not None:
@@ -326,21 +390,120 @@ class RecordingMixin:
             return audio
 
         def _record_linux(samplerate: int):
-            import sounddevice as sd
+            # 純 Linux / WSL：用 PulseAudio 原生 parec 擷取系統音（sink 的 .monitor）與
+            # 麥克風並混音，對齊 Windows 行為。
+            # 為何不用 sounddevice：PortAudio 直開 monitor source 在 WSLg 會卡死。
             import numpy as np
 
+            if not shutil.which("parec"):
+                logger.warning("找不到 parec，退回 sounddevice 麥克風擷取（無系統音）")
+                return _record_linux_mic_sd(samplerate)
+
+            mon = _pulse_monitor_source()
+            mic = _pulse_default_source()
+            if mic and mon and mic == mon:
+                mic = None                       # 預設來源本身就是 monitor → 不重複擷取
+            if not mon and not mic:
+                logger.error("找不到可用的 PulseAudio 來源（monitor / mic）")
+                self._notify_toast("找不到可用的音訊來源（PulseAudio）", "error", 8000)
+                return None
+
+            sys_chunks, mic_chunks, procs = [], [], []
+
+            def _reader(dev, channels, chunks, is_level_src):
+                cmd = ["parec", "--device", dev, "--format=float32le",
+                       "--rate={}".format(samplerate), "--channels={}".format(channels)]
+                try:
+                    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                except Exception as e:
+                    logger.warning("parec 啟動失敗（%s）：%s", dev, e)
+                    return
+                procs.append(p)
+                try:
+                    while not self._recording_stop_event.is_set():
+                        data = p.stdout.read(8192)
+                        if not data:
+                            break
+                        chunks.append(data)
+                        if is_level_src:
+                            self._recording_level = _calc_level(np.frombuffer(data, dtype="<f4"))
+                finally:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+
+            threads = []
+            if mon:
+                t = threading.Thread(target=_reader, args=(mon, 2, sys_chunks, True),
+                                     name="parec-sys", daemon=True)
+                t.start(); threads.append(t)
+                logger.info("System audio via parec: %s", mon)
+            if mic:
+                t = threading.Thread(target=_reader, args=(mic, 1, mic_chunks, not bool(mon)),
+                                     name="parec-mic", daemon=True)
+                t.start(); threads.append(t)
+                logger.info("Mic via parec: %s", mic)
+
+            while not self._recording_stop_event.is_set():
+                self._recording_stop_event.wait(timeout=0.1)
+
+            for p in procs:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+            for t in threads:
+                t.join(timeout=2)
+
+            def _decode(chunks, ch):
+                if not chunks:
+                    return None
+                a = np.frombuffer(b"".join(chunks), dtype="<f4")
+                if a.size == 0:
+                    return None
+                if ch >= 2:
+                    a = a[: (a.size // 2) * 2].reshape(-1, 2)
+                else:
+                    a = a.reshape(-1, 1)
+                    a = np.column_stack([a[:, 0], a[:, 0]])   # 單聲道 → 立體聲
+                return a.astype(np.float32)
+
+            a_sys = _decode(sys_chunks, 2)
+            a_mic = _decode(mic_chunks, 1)
+            if a_sys is None and a_mic is None:
+                logger.warning("No audio captured (parec)")
+                return None
+            if a_sys is not None and a_mic is not None:
+                n = max(len(a_sys), len(a_mic))
+                a_sys = np.pad(a_sys, ((0, n - len(a_sys)), (0, 0)))
+                a_mic = np.pad(a_mic, ((0, n - len(a_mic)), (0, 0)))
+                logger.info("Mixed sys+mic (parec): %d samples", n)
+                return np.clip(a_sys * 0.6 + a_mic * 0.6, -1.0, 1.0)
+            return a_sys if a_sys is not None else a_mic
+
+        def _record_linux_mic_sd(samplerate: int):
+            # 後備（無 parec）：sounddevice 只錄預設麥克風，避免碰會卡死的 monitor。
+            import sounddevice as sd
+            import numpy as np
             frames = []
 
-            def callback(indata, *_):
-                frames.append(np.column_stack([indata, indata]))
-                self._recording_level = _calc_level(indata)
+            def cb(indata, *_):
+                arr = indata.copy()
+                if arr.shape[1] == 1:
+                    arr = np.column_stack([arr, arr])
+                frames.append(arr)
+                self._recording_level = _calc_level(arr)
 
-            with sd.InputStream(device="rdpsource", samplerate=samplerate, channels=1, callback=callback):
-                while not self._recording_stop_event.is_set():
-                    self._recording_stop_event.wait(timeout=0.1)
-
+            try:
+                with sd.InputStream(samplerate=samplerate, channels=1, callback=cb):
+                    while not self._recording_stop_event.is_set():
+                        self._recording_stop_event.wait(timeout=0.1)
+            except Exception as e:
+                logger.error("sounddevice 麥克風錄音失敗：%s", e)
+                self._notify_toast(f"錄音失敗：{e}", "error", 8000)
+                return None
             if not frames:
-                logger.warning("No audio captured")
                 return None
             return np.concatenate(frames, axis=0)
 
@@ -394,6 +557,8 @@ class RecordingMixin:
         txt_stems = _stems_in(transcripts_dir, ".txt")
         md_stems = _stems_in(self._results_dir_path(), ".md")
         markers = _progress_markers(transcripts_dir)   # worker 寫的轉譯進度標記
+        requested = _request_stems(recordings_dir)      # 已按「轉逐字稿」、排入佇列的 stem
+        generating = getattr(self, "_generating", set())  # 正在生成會議紀錄的 stem
         active_stem = (
             Path(self._recording_filename).stem
             if (self._recording_filename and self._recording_thread
@@ -424,11 +589,15 @@ class RecordingMixin:
             elif has_result:
                 status = "done"
             elif has_transcript:
+                # 有逐字稿、缺會議紀錄 → 待整理（手動模式等使用者按「轉會議紀錄」）
                 status = "summarizing"
-            else:
+            elif stem in markers or stem in requested:
+                # 已排入 / 正在轉譯：有進度標記 → 估 %，僅有請求標記 → 排隊中
                 status = "transcribing"
-                # 轉譯中才算進度：有標記 → 轉譯中(估 %)，沒標記 → 排隊中
                 progress = _calc_progress(markers.get(stem))
+            else:
+                # 尚無逐字稿、也未排入 → 待轉譯（手動模式等使用者按「轉逐字稿」）
+                status = "pending"
 
             items.append({
                 "id": path.name,
@@ -440,6 +609,7 @@ class RecordingMixin:
                 "progress": progress,
                 "has_transcript": has_transcript,
                 "has_result": has_result,
+                "generating": stem in generating,   # 會議紀錄生成中（供前端顯示轉圈）
                 "time": time_str,
                 "path": str(path),
             })

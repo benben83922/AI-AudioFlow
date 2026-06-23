@@ -8,10 +8,12 @@ dependencies = [
     "pywebview>=5.0",
     "sounddevice>=0.5",
     "soundfile>=0.12",
+    "numpy>=1.24",
     "pydub>=0.25",
     "python-dotenv>=1.0",
     "httpx>=0.28",
     "structlog>=25.1",
+    "faster-whisper>=1.0",          # native 模式：本機 in-process 轉譯（無需 Docker）
     "pyaudiowpatch>=0.2; sys_platform == 'win32'",
     "pythonnet>=3.0; sys_platform == 'win32'",
     "clr_loader>=0.2; sys_platform == 'win32'",

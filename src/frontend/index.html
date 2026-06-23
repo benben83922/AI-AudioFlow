@@ -172,6 +172,7 @@
     <main class="flex-1 h-screen overflow-y-auto bg-bg-primary">
       <div class="p-6 flex flex-col gap-6 max-w-5xl">
 
+        <div id="global-deps-banner"></div>
         <div id="env-banner"></div>
 
         <div id="page-dashboard"    class="page active"></div>
@@ -331,7 +332,7 @@
     >${ico?`<i data-lucide="${ico}" class="w-4 h-4 ${icoCls}"></i>`:""} ${label?`<span>${label}</span>`:""}</button>`;
   }
 
-  function renderInput({ id, label, icon, placeholder="", type="text", value="", error, required=false }) {
+  function renderInput({ id, label, icon, placeholder="", type="text", value="", error, required=false, disabled=false }) {
     const border = error ? "border-status-error" : "border-border-default focus-within:border-accent-primary";
     const req = required ? '<span class="text-accent-primary ml-0.5">*</span>' : "";
     const pw  = type === "password"
@@ -341,11 +342,31 @@
       ${label?`<label for="${id}" class="text-xs font-medium text-text-secondary">${label}${req}</label>`:""}
       <div class="relative">
         ${icon?`<i data-lucide="${icon}" class="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-text-muted"></i>`:""}
-        <input id="${id}" name="${id}" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}"
-          class="w-full bg-bg-input border ${border} rounded-sm text-sm text-text-primary placeholder:text-text-muted ${icon?"pl-10":"pl-3"} ${type==="password"?"pr-10":"pr-3"} py-2.5 outline-none transition-colors" />
+        <input id="${id}" name="${id}" type="${type}" value="${esc(value)}" placeholder="${esc(placeholder)}" ${disabled?"disabled":""}
+          class="w-full bg-bg-input border ${border} rounded-sm text-sm text-text-primary placeholder:text-text-muted ${icon?"pl-10":"pl-3"} ${type==="password"?"pr-10":"pr-3"} py-2.5 outline-none transition-colors ${disabled?"opacity-60 cursor-not-allowed":""}" />
         ${pw}
       </div>
       ${error?`<span class="text-xs text-status-error">${error}</span>`:""}
+    </div>`;
+  }
+
+  // 資料夾欄位：可編輯時附「瀏覽」鈕；唯讀（Windows 逐字稿/紀錄）時鎖定並提示
+  function _folderField({ id, label, configVal, resolved, editable }) {
+    const inp = renderInput({ id, icon:"folder",
+      value: editable ? (configVal||"") : (resolved||""),
+      placeholder: resolved||"", disabled: !editable });
+    const browse = editable
+      ? renderButton({ variant:"secondary", icon:"folder-open", label:"瀏覽", size:"sm", onclick:`pickInto('${id}')` })
+      : "";
+    const lock = editable ? "" :
+      `<span class="text-xs text-text-muted flex items-center gap-1 mt-0.5"><i data-lucide="lock" class="w-3 h-3"></i>Windows 固定為 WSL 位置，不可變更</span>`;
+    return `<div class="flex flex-col gap-1.5">
+      <label class="text-xs font-medium text-text-secondary">${label}</label>
+      <div class="flex gap-2 items-center">
+        <div class="flex-1">${inp}</div>
+        ${browse}
+      </div>
+      ${lock}
     </div>`;
   }
 
@@ -432,14 +453,42 @@
   // 路由
   // ════════════════════════════════════════════
 
+  let _currentView = "dashboard";   // 目前頁面（決定全域缺套件提示是否顯示）
+  let _depsBannerSig = "";          // 上次提示簽章，避免無變化重繪
+
   function navigateTo(view) {
     // 離開「服務管理」頁就停止其輪詢（compose 狀態查詢較重，只在該頁進行）
     if (view !== "services") { clearInterval(_svcInterval); _svcInterval = null; }
+    _currentView = view;
     document.querySelectorAll(".page").forEach(p => p.classList.remove("active"));
     document.getElementById(`page-${view}`)?.classList.add("active");
     document.querySelectorAll(".nav-item").forEach(n => n.classList.remove("nav-item-active"));
     document.querySelector(`.nav-item[onclick="navigateTo('${view}')"]`)?.classList.add("nav-item-active");
     renderPage(view);
+    refreshDepsBanner();   // 切頁時更新「缺套件」全域提示（設定頁不顯示）
+  }
+
+  // 全域提示：偵測到缺系統套件時，在「設定頁以外」的每一頁顯示，引導去設定頁複製指令
+  async function refreshDepsBanner() {
+    const el = document.getElementById("global-deps-banner");
+    if (!el) return;
+    let missing = [];
+    if (_currentView !== "settings") {
+      const sysd = await callApi("get_system_deps");
+      if (sysd?.supported && sysd?.missing) missing = sysd.missing;
+    }
+    const sig = _currentView + "|" + missing.map(m => m.pkg).join(",");
+    if (sig === _depsBannerSig) return;     // 無變化 → 不重繪（避免閃爍）
+    _depsBannerSig = sig;
+    if (!missing.length) { el.innerHTML = ""; return; }
+    const pkgs = missing.map(m => m.pkg).join("、");
+    el.innerHTML = `
+      <div class="flex items-center gap-3 px-4 py-3 rounded-md border bg-warn/10 border-warn/40 text-warn">
+        <i data-lucide="package" class="w-5 h-5 flex-shrink-0"></i>
+        <div class="flex-1 text-sm font-medium">偵測到缺少系統套件：${esc(pkgs)}，部分功能受影響。請到「設定」頁複製安裝指令並執行。</div>
+        ${renderButton({ variant:"secondary", icon:"arrow-right", label:"前往設定", size:"sm", onclick:"navigateTo('settings')" })}
+      </div>`;
+    refreshIcons();
   }
 
   function renderPage(v) {
@@ -515,6 +564,8 @@
 
   let _recStatusInterval = null;
   let _lastRecState = null;          // 記錄上次 recording 狀態，僅在切換時整段重繪
+  let _recTopic = "";                // 會議主題（跨重繪保留，避免輸入被輪詢洗掉）
+  let _recDate = "";                 // 日期（空＝用今日）
 
   async function renderRecording() {
     renderInto("page-recording", `
@@ -573,6 +624,23 @@
         </div>
       </div>` : "";
 
+    // 會議主題 / 日期（僅待機時可填；值存模組變數，跨輪詢重繪不被洗掉）。檔名 = 主題_日期
+    const _today = new Date().toISOString().slice(0, 10);
+    const _dateVal = _recDate || _today;
+    const meta = isRecording ? "" : `
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-5">
+        <div class="flex flex-col gap-1.5">
+          <label class="text-xs font-medium text-text-secondary">會議主題</label>
+          <input id="rec-topic" value="${esc(_recTopic)}" placeholder="例：產品週會" oninput="_recTopic=this.value"
+            class="w-full bg-bg-input border border-border-default focus:border-accent-primary rounded-sm text-sm text-text-primary placeholder:text-text-muted px-3 py-2.5 outline-none transition-colors" />
+        </div>
+        <div class="flex flex-col gap-1.5">
+          <label class="text-xs font-medium text-text-secondary">日期</label>
+          <input id="rec-date" type="date" value="${esc(_dateVal)}" oninput="_recDate=this.value"
+            class="w-full bg-bg-input border border-border-default focus:border-accent-primary rounded-sm text-sm text-text-primary px-3 py-2.5 outline-none transition-colors" />
+        </div>
+      </div>`;
+
     const controlHtml = `
       <div class="flex items-center gap-3 mb-5">
         <div class="w-2.5 h-2.5 rounded-full ${isRecording ? "bg-status-error animate-pulse" : "bg-text-muted"}"></div>
@@ -580,6 +648,7 @@
         ${isRecording ? `<span id="rec-timer" class="text-sm text-text-muted font-mono">00:00</span>` : ""}
       </div>
       ${vu}
+      ${meta}
       <div class="flex gap-3 flex-wrap">
         ${isRecording
           ? `${renderButton({ variant:"danger",    icon:"square",   label:"停止錄音",  onclick:"stopRecording()" })}
@@ -606,14 +675,15 @@
 
     renderInto("panel-rec-list", renderSectionPanel({
       icon: "list", iconColor: "text-text-muted",
-      title: "錄音與會議紀錄", description: `共 ${recordings?.length ?? 0} 筆 · 完成後可檢視 / 複製 / 匯出紀錄`,
+      title: "錄音與會議紀錄", description: `共 ${recordings?.length ?? 0} 筆 · 逐檔按「轉逐字稿」→「轉會議紀錄」，完成後可檢視 / 複製 / 匯出`,
       children: rows,
       headerActions: renderButton({ variant:"secondary", icon:"refresh-cw", label:"重新整理", size:"sm", onclick:"_refreshRecordingList()" }),
     }));
 
-    // 有檔案在轉譯/生成中 → 每 5s 自動刷新讓進度 % 跟著動；都閒置就停
+    // 有檔案在「轉譯中」或「整理中」→ 每 5s 自動刷新讓進度跟著動；
+    // 「待轉譯 / 待整理」是等使用者按按鈕的閒置態，不需輪詢。
     clearTimeout(_recListTimer);
-    const busy = recordings?.some(r => r.status === "transcribing" || r.status === "summarizing");
+    const busy = recordings?.some(r => r.status === "transcribing" || r.generating);
     if (busy && document.getElementById("panel-rec-list")) {
       _recListTimer = setTimeout(_refreshRecordingList, 5000);
     }
@@ -621,8 +691,9 @@
 
   const REC_STAGE = {
     recording:    { s:"error",   t:"錄音中" },
+    pending:      { s:"warning", t:"待轉譯" },
     transcribing: { s:"info",    t:"轉譯中" },
-    summarizing:  { s:"warning", t:"生成紀錄中" },
+    summarizing:  { s:"warning", t:"待整理" },
     done:         { s:"success", t:"完成" },
   };
 
@@ -658,12 +729,21 @@
     if (showActions) {
       const btns = [];
       if (r.status === "done") {
+        // 完成：檢視 / 複製 / 匯出
         btns.push(renderButton({ variant:"primary",   icon:"eye",       label:"檢視", size:"sm", onclick:`viewResult('${stem}')` }));
         btns.push(renderButton({ variant:"secondary", icon:"copy",                    size:"sm", onclick:`copyResult('${stem}')` }));
         btns.push(renderButton({ variant:"secondary", icon:"download",                size:"sm", onclick:`exportResult('${stem}')` }));
       } else if (r.status === "summarizing") {
-        btns.push(renderButton({ variant:"primary",   icon:"sparkles",  label:"生成會議紀錄", size:"sm", onclick:`generateResult('${stem}')` }));
-        btns.push(renderButton({ variant:"secondary", icon:"file-text", label:"逐字稿",       size:"sm", onclick:`viewTranscript('${stem}')` }));
+        // 已有逐字稿、待整理：手動按「轉會議紀錄」（生成中顯示轉圈、停用）
+        if (r.generating) {
+          btns.push(renderButton({ variant:"primary", label:"整理中…", size:"sm", loading:true }));
+        } else {
+          btns.push(renderButton({ variant:"primary", icon:"sparkles", label:"轉會議紀錄", size:"sm", onclick:`generateResult('${stem}')` }));
+        }
+        btns.push(renderButton({ variant:"secondary", icon:"file-text", label:"逐字稿", size:"sm", onclick:`viewTranscript('${stem}')` }));
+      } else if (r.status === "pending") {
+        // 尚無逐字稿、待轉譯：手動按「轉逐字稿」
+        btns.push(renderButton({ variant:"primary", icon:"file-audio-2", label:"轉逐字稿", size:"sm", onclick:`transcribeRecording('${id}')` }));
       }
       btns.push(renderButton({ variant:"ghost", icon:"trash-2", size:"sm", onclick:`deleteRecording('${id}')` }));
       actions = `<div class="flex items-center gap-1.5 flex-shrink-0">${btns.join("")}</div>`;
@@ -740,10 +820,11 @@
       }));
       return;
     }
-    const rows = SERVICE_LIST.map(s => _serviceRow(s, data[s.key])).join("");
+    // 只渲染後端「有回傳」的服務（native 模式不含 openclaw，會自動略過）
+    const rows = SERVICE_LIST.filter(s => data[s.key]).map(s => _serviceRow(s, data[s.key])).join("");
     renderInto("panel-services", renderSectionPanel({
       icon:"server", iconColor:"text-accent-secondary",
-      title:"背景服務", description:"主程式啟動時會自動全部拉起，可在此手動啟停",
+      title:"背景服務", description:"處理服務可手動啟停；偵測型引擎（轉譯 / 整理）只需重新偵測",
       children: rows,
       headerActions: renderButton({ variant:"secondary", icon:"refresh-cw", label:"重新整理", size:"sm", onclick:"_refreshServices()" }),
     }));
@@ -754,9 +835,12 @@
     const running = !!svc.running;
     const sm = SVC_STATUS_MAP[svc.status] || (running ? SVC_STATUS_MAP.running : SVC_STATUS_MAP.stopped);
     const transient = svc.status === "starting" || svc.status === "pulling";
-    const btn = running
-      ? renderButton({ variant:"danger",  icon:"square", label:"停止", size:"sm", onclick:`stopService('${meta.key}')` })
-      : renderButton({ variant:"primary", icon:"play",   label:"啟動", size:"sm", onclick:`startService('${meta.key}')`, disabled: transient });
+    // 偵測型引擎（faster-whisper / claude）不是可啟停的背景服務，只給「重新偵測」
+    const btn = svc.detectable_only
+      ? renderButton({ variant:"secondary", icon:"refresh-cw", label:"重新偵測", size:"sm", onclick:"redetectServices()" })
+      : (running
+        ? renderButton({ variant:"danger",  icon:"square", label:"停止", size:"sm", onclick:`stopService('${meta.key}')` })
+        : renderButton({ variant:"primary", icon:"play",   label:"啟動", size:"sm", onclick:`startService('${meta.key}')`, disabled: transient }));
     const sub = `${esc(svc.description || "")}${svc.message ? ` · ${esc(svc.message)}` : ""}`;
     return `<div class="flex items-center gap-3 py-3.5 border-b border-border-default last:border-b-0">
       <div class="w-9 h-9 rounded-sm bg-bg-input flex items-center justify-center flex-shrink-0">
@@ -788,6 +872,13 @@
     const r = await callApi("stop_service", key);
     showToast(r?.message || "停止指令已送出", "info");
     setTimeout(_refreshServices, 800);
+  }
+
+  async function redetectServices() {
+    // 偵測型引擎（faster-whisper / claude）重新偵測：清快取後刷新狀態
+    showToast("重新偵測引擎中…", "info");
+    await callApi("redetect_services");
+    _refreshServices();
   }
 
   async function startAllServices() {
@@ -855,6 +946,8 @@
         <h1 class="text-xl font-bold">設定</h1>
         <p class="text-sm text-text-muted mt-0.5">API 金鑰與服務設定</p>
       </div>
+      <div id="panel-set-sysdeps"></div>
+      <div id="panel-set-prompt">${renderLoading()}</div>
       <div id="panel-set-api">${renderLoading()}</div>
       <div id="panel-set-storage">${renderLoading()}</div>
       <div id="panel-set-danger"></div>
@@ -863,6 +956,49 @@
     const settings = await callApi("load_settings");
     const keys    = settings?.api_keys  || {};
     const storage = settings?.storage   || {};
+    const sp      = await callApi("get_storage_paths") || {};
+
+    // 系統相依（Linux）：偵測缺少的 OS 套件 → 一鍵 pkexec 安裝（只有缺漏才顯示此區塊）
+    const sysd = await callApi("get_system_deps") || {};
+    if (sysd.supported && sysd.missing && sysd.missing.length) {
+      const items = sysd.missing.map(m =>
+        `<li class="flex items-center gap-2"><code class="text-warn">${esc(m.pkg)}</code><span class="text-text-muted text-xs">— ${esc(m.reason)}</span></li>`).join("");
+      const cmd = "sudo apt install -y " + sysd.missing.map(m => m.pkg).join(" ");
+      renderInto("panel-set-sysdeps", renderSectionPanel({
+        icon:"package", iconColor:"text-warn",
+        title:"系統相依（偵測到缺少）",
+        description:"下列系統套件未安裝，會影響錄音 / 系統音擷取",
+        children:`<div class="flex flex-col gap-3">
+          <ul class="flex flex-col gap-1.5 text-sm">${items}</ul>
+          <div class="text-xs text-text-muted">安裝指令：<code>${esc(cmd)}</code></div>
+          <div class="flex gap-3">
+            ${sysd.can_auto ? renderButton({ variant:"primary", icon:"download-cloud", label:"嘗試自動安裝（跳密碼框）", onclick:"installSysDeps()" }) : ""}
+            ${renderButton({ variant: sysd.can_auto ? "secondary" : "primary", icon:"clipboard", label:"複製安裝指令", onclick:`copyText('${cmd}')` })}
+          </div>
+          ${sysd.can_auto ? "" : `<div class="text-xs text-text-muted">此環境無 pkexec（無法跳密碼框）；複製指令後到終端機貼上執行即可。</div>`}
+        </div>`,
+      }));
+    } else {
+      renderInto("panel-set-sysdeps", "");
+    }
+
+    // 會議紀錄 Prompt（可編輯；「轉會議紀錄」時餵給 Claude 的指示）
+    const sumP = await callApi("get_summary_prompt") || {};
+    const promptVal = (sumP.custom && sumP.custom.trim()) ? sumP.custom : (sumP.default || "");
+    renderInto("panel-set-prompt", renderSectionPanel({
+      icon: "sparkles", iconColor: "text-status-info",
+      title: "會議紀錄 Prompt",
+      description: "「轉會議紀錄」時餵給 Claude 的指示，可自由編輯（留空＝用預設）",
+      children: `<div class="flex flex-col gap-3">
+        <textarea id="summary-prompt" rows="16" spellcheck="false"
+          class="w-full bg-bg-input border border-border-default focus:border-accent-primary rounded-sm text-sm text-text-primary font-mono leading-relaxed px-3 py-2.5 outline-none transition-colors resize-y">${esc(promptVal)}</textarea>
+        <div class="text-xs text-text-muted">逐字稿會自動接在這段 Prompt 之後一起送出。</div>
+        <div class="flex gap-3">
+          ${renderButton({ variant:"primary",   icon:"save",       label:"儲存 Prompt", onclick:"saveSummaryPrompt()" })}
+          ${renderButton({ variant:"secondary", icon:"rotate-ccw", label:"回復預設",     onclick:"resetSummaryPrompt()" })}
+        </div>
+      </div>`,
+    }));
 
     // API Keys
     renderInto("panel-set-api", renderSectionPanel({
@@ -879,9 +1015,14 @@
     // Storage & Integration
     renderInto("panel-set-storage", renderSectionPanel({
       icon: "cloud", iconColor: "text-status-info",
-      title: "儲存與整合設定", description: "本地資料夾、雲端儲存、Webhook",
+      title: "儲存與整合設定",
+      description: sp.locked
+        ? "Windows：逐字稿／會議紀錄固定為 WSL 位置（唯讀），錄音資料夾可自訂"
+        : "三段資料夾皆可自訂，但需為三個不同的位置",
       children: `<div class="flex flex-col gap-4">
-        ${renderInput({ id:"local-path",   label:"本地錄音資料夾",        icon:"folder", placeholder:"D:/AudioFlow/recordings/", value: storage.local_path || "" })}
+        ${_folderField({ id:"local-path",       label:"錄音資料夾",     configVal: sp.recordings_set,  resolved: sp.recordings,  editable: true })}
+        ${_folderField({ id:"transcripts-path", label:"逐字稿資料夾",   configVal: sp.transcripts_set, resolved: sp.transcripts, editable: !sp.locked })}
+        ${_folderField({ id:"results-path",     label:"會議紀錄資料夾", configVal: sp.results_set,     resolved: sp.results,     editable: !sp.locked })}
         ${renderInput({ id:"drive-folder", label:"Google Drive 資料夾 ID", icon:"cloud",  placeholder:"1BxiMVs0XRA5nFMdKvBd...", value: storage.drive_folder_id || "" })}
         ${renderInput({ id:"webhook-url",  label:"Make Webhook URL",       icon:"link",   placeholder:"https://hook.make.com/...", value: storage.webhook_url || "" })}
         <div class="mt-1 flex gap-3">
@@ -915,7 +1056,9 @@
       showToast(_envMessage || "尚未就緒，無法開始錄音", "error");
       return;
     }
-    const result = await callApi("start_recording");
+    const topic = (document.getElementById("rec-topic")?.value ?? _recTopic).trim();
+    const date  = (document.getElementById("rec-date")?.value ?? _recDate).trim();
+    const result = await callApi("start_recording", topic, date);
     if (result) {
       showToast(`開始錄音：${result.filename}`, "success");
       _lastRecState = null;
@@ -969,8 +1112,9 @@
       title:"刪除錄音", message:`確定要刪除「${id}」？此操作無法復原。`,
       confirmLabel:"確認刪除", confirmVariant:"danger",
       onConfirm: async () => {
-        const result = await callApi("delete_recording", id);
-        if (result !== null) {
+        // 刪除為「無回傳資料」的寫入操作 → 用 callApiOk 判斷成功（_ok() data=null 仍算成功）
+        const ok = await callApiOk("delete_recording", id);
+        if (ok) {
           showToast("錄音已刪除", "success");
           _refreshRecordingList();
         } else {
@@ -1028,6 +1172,19 @@
     }
   }
 
+  async function transcribeRecording(id) {
+    // 手動觸發轉逐字稿：寫請求標記，背景 worker 取走轉譯；清單輪詢刷新顯示進度
+    let r;
+    try { r = await window.pywebview.api.transcribe_recording(id); }
+    catch (e) { showToast("排入轉譯失敗", "error"); return; }
+    if (r?.success) {
+      showToast(r.data?.message || "已排入轉譯…", "info");
+      _refreshRecordingList();
+    } else {
+      showToast(r?.error?.message || "無法轉譯", "error");
+    }
+  }
+
   async function copyResult(stem) {
     const r = await callApi("get_result", stem);
     if (!r) { showToast("會議紀錄尚未生成", "warning"); return; }
@@ -1063,12 +1220,53 @@
     ok ? showToast("已儲存", "success") : showToast("儲存失敗", "error");
   }
 
+  async function installSysDeps() {
+    showToast("請在彈出的系統密碼框授權，安裝進行中…", "info", 10000);
+    let r;
+    try { r = await window.pywebview.api.install_system_deps(); }
+    catch (e) { showToast("安裝失敗", "error"); return; }
+    if (r?.success) { showToast(r.data?.message || "安裝完成", "success"); renderSettings(); }
+    else showToast(r?.error?.message || "安裝失敗", "error");
+  }
+
+  async function saveSummaryPrompt() {
+    const t = document.getElementById("summary-prompt")?.value ?? "";
+    const ok = await callApiOk("save_summary_prompt", t);
+    ok ? showToast("會議紀錄 Prompt 已儲存", "success") : showToast("儲存失敗", "error");
+  }
+
+  async function resetSummaryPrompt() {
+    showConfirmModal({
+      icon:"rotate-ccw", iconBg:"background:#3b82f615", iconColor:"text-status-info",
+      title:"回復預設 Prompt", message:"將清除你的自訂內容，改用內建預設 Prompt。",
+      confirmLabel:"回復預設", confirmVariant:"primary",
+      onConfirm: async () => {
+        const ok = await callApiOk("save_summary_prompt", "");
+        if (ok) { showToast("已回復預設 Prompt", "success"); renderSettings(); }
+        else showToast("操作失敗", "error");
+      },
+    });
+  }
+
   async function saveStorage() {
-    const local    = document.getElementById("local-path")?.value?.trim()   || "";
-    const driveId  = document.getElementById("drive-folder")?.value?.trim() || "";
-    const webhook  = document.getElementById("webhook-url")?.value?.trim()  || "";
-    const ok = await callApiOk("save_storage_settings", local, driveId, webhook);
-    ok ? showToast("儲存設定已更新", "success") : showToast("儲存失敗", "error");
+    const val = id => document.getElementById(id)?.value?.trim() || "";
+    const local = val("local-path"), tx = val("transcripts-path"), rs = val("results-path");
+    const driveId = val("drive-folder"), webhook = val("webhook-url");
+    let r;
+    try { r = await window.pywebview.api.save_storage_settings(local, tx, rs, driveId, webhook); }
+    catch (e) { showToast("儲存失敗", "error"); return; }
+    if (r?.success) {
+      showToast(r.data?.message || "儲存設定已更新", "success");
+      renderSettings();   // 重新整理，反映正規化後的路徑與鎖定狀態
+    } else {
+      showToast(r?.error?.message || "儲存失敗", "error");
+    }
+  }
+
+  async function pickInto(id) {
+    // 開資料夾選擇對話框，把選到的路徑填入指定輸入框
+    const p = await callApi("pick_folder");
+    if (p) { const el = document.getElementById(id); if (el) el.value = p; }
   }
 
   async function testConnection() {
@@ -1089,8 +1287,9 @@
         if (!recordings?.length) { showToast("沒有可清除的錄音檔案", "info"); return; }
         let ok = 0;
         for (const r of recordings) {
-          if ((await callApi("delete_recording", r.id)) !== null) ok++;
+          if (await callApiOk("delete_recording", r.id)) ok++;   // data-less 成功用 callApiOk
         }
+        _refreshRecordingList();
         showToast(`已清除 ${ok} 個錄音檔案`, ok ? "success" : "error");
       },
     });
@@ -1106,6 +1305,8 @@
   let _envBlocker = "";           // 阻擋類別：docker_not_installed | docker_not_running | wsl | audio | services
   let _envInterval = null;
   let _healthInterval = null;
+  let _depsInterval = null;       // 全域「缺系統套件」提示輪詢
+  let _lastEnvSig = "";           // 上次重繪錄音面板時的環境簽章（避免每 5s 重繪洗掉輸入焦點）
 
   async function refreshEnvStatus() {
     const env = await callApi("get_environment_status");
@@ -1143,8 +1344,12 @@
       }
     }
 
-    // 錄音控制若正顯示，更新按鈕可用狀態與引擎就緒提示
-    if (document.getElementById("panel-rec-control")) _renderRecControl(!!_lastRecState);
+    // 錄音控制若正顯示，且環境狀態「有變化」才重繪（否則每 5s 重繪會把輸入框焦點/游標洗掉）
+    const sig = `${_canRecord}|${_envBlocker}|${_envMessage}`;
+    if (document.getElementById("panel-rec-control") && sig !== _lastEnvSig) {
+      _lastEnvSig = sig;
+      _renderRecControl(!!_lastRecState);
+    }
   }
 
   async function _refreshSidebarHealth() {
@@ -1207,6 +1412,11 @@
     _refreshSidebarHealth();
     clearInterval(_healthInterval);
     _healthInterval = setInterval(_refreshSidebarHealth, 15000);
+
+    // 全域「缺系統套件」提示：立即檢查並每 15s 重檢（裝好後自動消失）
+    refreshDepsBanner();
+    clearInterval(_depsInterval);
+    _depsInterval = setInterval(refreshDepsBanner, 15000);
   }
 
   // ════════════════════════════════════════════

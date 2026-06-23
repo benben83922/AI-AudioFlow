@@ -14,6 +14,7 @@ import subprocess
 from pathlib import Path
 
 from src.bridge._helpers import _ok
+from src.bridge._platform import detect_platform, uses_windows_host, WINDOWS, WSL
 
 logger = logging.getLogger(__name__)
 
@@ -29,11 +30,33 @@ def _is_frozen() -> bool:
 
 
 def _worker_running(port: int = WORKER_LOCK_PORT, pid_file: "Path | None" = None) -> bool:
-    """Windows 側 worker 的單例鎖 port 用 listen(1) 且從不 accept()，
-    connect_ex 連一次就塞滿 backlog，導致後續全部被拒。
-    改用 powershell.exe Get-NetTCPConnection 查詢監聽狀態（Windows / WSL2 皆適用）。
+    """worker 是否在跑（靠它的單例鎖 port 判斷）。
+
+    Windows 側 worker 的單例鎖 port 用 listen(1) 且從不 accept()，connect_ex 連一次
+    就塞滿 backlog，導致後續全部被拒，故改查監聽狀態：
+        - Windows / WSL2：powershell.exe Get-NetTCPConnection（WSL 走 .exe interop）。
+        - 純 Linux：試綁同一 port 判斷是否已被占用（無 Windows 主機可問）。
     """
-    return _win_port_listening(port)
+    if uses_windows_host():
+        return _win_port_listening(port)
+    return _linux_port_listening(port)
+
+
+def _linux_port_listening(port: int) -> bool:
+    """純 Linux：嘗試綁定 port 判斷 worker 是否在執行。
+
+    worker（worker_main.py）啟動時會「不設 SO_REUSEADDR」獨佔綁定此 port 當單例鎖。
+    這裡同樣試綁：綁得起來 → 沒人聽 → worker 未執行；EADDRINUSE → worker 在跑。
+    測試 socket 立即關閉，不影響 worker。
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", port))
+        return False            # 綁得起來 = 沒人在聽 = worker 未執行
+    except OSError:
+        return True             # 已被占用 = worker 在跑
+    finally:
+        s.close()
 
 
 def _win_port_listening(port: int) -> bool:
@@ -56,10 +79,11 @@ def _win_port_listening(port: int) -> bool:
 
 
 def _pid_on_port(port: int) -> int | None:
-    """找出占用 lock port 的 Windows PID。
-    Windows 原生用 netstat；WSL2 用 powershell.exe Get-NetTCPConnection。"""
+    """找出占用 lock port 的程序 PID。
+    Windows 原生用 netstat；WSL2 用 powershell.exe；純 Linux 用 ss。"""
     try:
-        if sys.platform == "win32":
+        plat = detect_platform()
+        if plat == WINDOWS:
             r = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True,
                                text=True, encoding="utf-8", errors="replace",
                                timeout=10, creationflags=_CREATE_NO_WINDOW)
@@ -68,7 +92,7 @@ def _pid_on_port(port: int) -> int | None:
                 if len(parts) >= 5 and parts[3].upper() == "LISTENING" \
                         and parts[1].endswith(f":{port}"):
                     return int(parts[4])
-        else:
+        elif plat == WSL:
             # WSL2：透過 powershell.exe 查 Windows 端的 TCP 監聽程序
             r = subprocess.run(
                 [
@@ -82,21 +106,44 @@ def _pid_on_port(port: int) -> int | None:
             pid_str = r.stdout.strip()
             if pid_str.isdigit():
                 return int(pid_str)
+        else:
+            return _linux_pid_on_port(port)
     except Exception as e:
         logger.warning("查詢 port %d 的 PID 失敗：%s", port, e)
     return None
 
 
-def _kill_pid(pid: int) -> bool:
-    """終止指定 PID。Windows 原生用 taskkill；WSL2 用 taskkill.exe。"""
+def _linux_pid_on_port(port: int) -> int | None:
+    """純 Linux：用 ss 找出監聽該 port 的本機 PID。"""
     try:
-        if sys.platform == "win32":
+        r = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=5)
+    except Exception as e:
+        logger.warning("ss 查詢 port %d 失敗：%s", port, e)
+        return None
+    for line in r.stdout.splitlines():
+        # 本機位址欄含 :<port>，且該行帶 users:(("...",pid=NNN,...))
+        if re.search(rf"[:.]{port}\s", line):
+            m = re.search(r"pid=(\d+)", line)
+            if m:
+                return int(m.group(1))
+    return None
+
+
+def _kill_pid(pid: int) -> bool:
+    """終止指定 PID。Windows 原生用 taskkill；WSL2 用 taskkill.exe；純 Linux 用 SIGTERM。"""
+    try:
+        plat = detect_platform()
+        if plat == WINDOWS:
             subprocess.run(["taskkill", "/PID", str(pid), "/F", "/T"], capture_output=True,
                            text=True, encoding="utf-8", errors="replace",
                            timeout=10, creationflags=_CREATE_NO_WINDOW)
-        else:
+        elif plat == WSL:
             subprocess.run(["taskkill.exe", "/PID", str(pid), "/F"], capture_output=True,
                            text=True, encoding="utf-8", errors="replace", timeout=10)
+        else:
+            # 純 Linux：SIGTERM 讓 worker 走正常收尾（它有註冊 SIGTERM 處理）
+            os.kill(pid, signal.SIGTERM)
         return True
     except Exception as e:
         logger.error("終止 PID %s 失敗：%s", pid, e)
@@ -125,6 +172,31 @@ class WorkerMixin:
         env.setdefault("STT_REQUEST_TIMEOUT", "1800")
         # detached 程序沒有主控台，logging 導向檔案方便查看（打包後寫在 exe 同層）
         env["STT_LOG_FILE"] = str(getattr(self, "_data_root", self._project_root) / "worker.log")
+
+        # 自動 vs 手動：手動模式下 worker 只在收到「轉逐字稿」請求標記時才轉譯，整理一律
+        # 留給 app 按鈕（generate_result）。
+        env["STT_AUTO"] = "1" if self._auto_pipeline() else "0"
+
+        # 後端模式：docker（HTTP→whisper 容器，整理交給 openclaw）vs native（本機
+        # faster-whisper + claude -p，worker 內一條龍做完轉譯與整理，不需 Docker）。
+        mode = self._pipeline_mode()
+        env["STT_BACKEND"] = mode
+        if mode == "native":
+            results = self._results_dir_path()
+            if results is not None:
+                env["STT_RESULTS_DIR"] = str(results)
+            stt = config.get("stt", {})
+            env["WHISPER_MODEL"] = stt.get("model", "large-v3-turbo")
+            env["WHISPER_DEVICE"] = stt.get("device", "cpu")
+            env["WHISPER_COMPUTE_TYPE"] = stt.get("compute_type", "int8")
+            # 模型快取（首次自動下載到這；亦可預先放好達成「執行時不下載」）
+            env["WHISPER_DOWNLOAD_ROOT"] = str(
+                getattr(self, "_data_root", self._project_root) / "models")
+            token = config.get("api_keys", {}).get("claude", "").strip()
+            if token:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = token   # 否則靠使用者於 host/WSL 已登入
+            env["CLAUDE_MODEL"] = "opus"
+            env["SUMMARY_PROMPT"] = self._summary_prompt()   # 自訂會議紀錄 prompt（空＝預設）
         return env
 
     def _worker_launch_cmd(self) -> list[str]:

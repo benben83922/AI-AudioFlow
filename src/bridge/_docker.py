@@ -12,8 +12,16 @@ import threading
 import subprocess
 
 from src.bridge._helpers import _ok
+from src.bridge._worker import _worker_running
 
 logger = logging.getLogger(__name__)
+
+
+def _native_engine_ready() -> bool:
+    """native 轉譯引擎（faster-whisper）是否可用。用 find_spec 探測，不實際 import
+    （ctranslate2 載入很重，不該在每次輪詢環境狀態時觸發）。"""
+    import importlib.util
+    return importlib.util.find_spec("faster_whisper") is not None
 
 STT_CONTAINER = "whisper-stt-server"
 # 此 image 只有滾動 tag（latest / latest-amd64 / cuda），沒有版本號可釘，
@@ -234,7 +242,13 @@ class DockerMixin:
             3. 有可用的音訊輸入裝置（麥克風或系統音 loopback）
             4. 四個背景服務全部 running
         任一不滿足 → can_record=False，並回傳第一個阻擋原因（blocker + message）。
+
+        native 模式（無 Docker）：錄音門檻只看音訊裝置，轉譯由本機 faster-whisper
+        in-process 完成、整理由 claude -p 事後補跑，皆不擋錄音。
         """
+        if self._pipeline_mode() == "native":
+            return self._environment_status_native()
+
         d_state, dmsg = self._docker_state()
         docker_installed = d_state != "not_installed"
         docker_running = d_state == "ok"
@@ -284,4 +298,42 @@ class DockerMixin:
             "can_record": can_record,
             "blocker": blocker,
             "message": message,
+        })
+
+    def _environment_status_native(self) -> dict:
+        """native 模式的錄音就緒判斷：只看音訊裝置；轉譯/整理不擋錄音。
+
+        回傳鍵與 docker 模式對齊（前端共用），但 docker/wsl 一律視為「不適用→True」，
+        避免前端跳出 Docker/WSL 安裝提示。"""
+        audio_ok, amsg = self._audio_input_available()
+        worker_up = _worker_running()
+        engine_ok = _native_engine_ready()
+        try:
+            import src.claude_cli as claude_cli
+            claude = claude_cli.detect()
+        except Exception:
+            claude = {"available": False, "mode": None, "message": ""}
+
+        if not audio_ok:
+            blocker, message = "audio", amsg or "找不到可用的音訊輸入裝置（麥克風或系統音）"
+        elif not engine_ok:
+            # 不擋錄音，但提示：缺 faster-whisper 則無法本機轉譯
+            blocker, message = "engine", "尚未安裝 faster-whisper，無法本機轉譯（pip install faster-whisper）"
+        else:
+            blocker, message = "", ""
+
+        return _ok({
+            "docker_installed": True,        # native 不需 Docker；回 True 讓前端不顯示安裝提示
+            "docker_running": True,
+            "wsl_ok": True,
+            "audio_available": audio_ok,
+            "stt_status": "running" if worker_up else "stopped",
+            "services_ready": worker_up,
+            "can_record": audio_ok,          # 只要有音訊就能錄；轉譯/整理事後進行
+            "can_summarize": claude.get("available", False),
+            "claude_available": claude.get("available", False),
+            "claude_mode": claude.get("mode"),
+            "blocker": blocker,
+            "message": message,
+            "mode": "native",
         })

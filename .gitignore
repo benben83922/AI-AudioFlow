@@ -34,6 +34,14 @@ Thumbs.db
 # STT worker 執行期產物
 stt-worker/worker.pid
 stt-worker/worker.log
+worker.log
+
+# native 模式：faster-whisper 模型快取（~1.5GB，執行時自動下載，勿進版控）
+models/
+
+# 逐字稿 / 會議紀錄輸出（含會議內容，不進版控）
+transcripts/
+results/
 
 # 打包前置自動生成（compose 內嵌）；勿進版控，build 時重生
 src/_bundled_assets.py

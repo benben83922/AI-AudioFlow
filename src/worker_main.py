@@ -32,6 +32,10 @@ _log_file = os.environ.get("STT_LOG_FILE")
 logging.basicConfig(
     level=os.environ.get("STT_LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] stt-worker: %(message)s",
+    # force：worker 由 `python -m src.main --worker` 啟動，src/main.py 在模組載入時已先
+    # basicConfig 給 root 裝了 StreamHandler，使這裡的 filename 變 no-op。force=True 強制
+    # 移除既有 handler 改裝 FileHandler，logs 才會真正寫進 STT_LOG_FILE。
+    force=True,
     **({"filename": _log_file} if _log_file else {}),
 )
 logger = logging.getLogger("stt-worker")
@@ -54,11 +58,27 @@ class Config:
     request_timeout: float         # 單檔 HTTP 逾時（長錄音要夠大）
     max_retries: int
     lock_port: int                 # 單例互斥用的 localhost port
+    # ── 後端選擇與 native（無 Docker）模式參數 ──
+    backend: str = "docker"        # docker（HTTP→whisper 容器）| native（本機 faster-whisper）
+    results_dir: Path | None = None        # native：會議紀錄 .md 輸出（docker 模式由 openclaw 負責）
+    whisper_model: str = "large-v3-turbo"  # native faster-whisper 模型
+    whisper_device: str = "cpu"
+    whisper_compute_type: str = "int8"
+    download_root: str | None = None       # native 模型快取 / 隨包附帶目錄
+    claude_model: str = "opus"             # native 整理用 claude -p 模型
+    claude_token: str = ""
+    claude_timeout: float = 600.0
+    summary_prompt: str = ""               # 自訂會議紀錄 prompt（空＝預設）
+    # 自動 vs 手動：False＝每檔需「轉逐字稿」請求標記才轉譯，整理一律留給 app（按鈕）
+    auto: bool = True
 
     @staticmethod
     def from_env() -> "Config":
         outbox = Path(os.environ.get("STT_OUTBOX_DIR", "~/stt-outbox")).expanduser()
         done_raw = os.environ.get("STT_DONE_DIR", "").strip()
+        backend = os.environ.get("STT_BACKEND", "docker").strip().lower()
+        results_raw = os.environ.get("STT_RESULTS_DIR", "").strip()
+        download_root = os.environ.get("WHISPER_DOWNLOAD_ROOT", "").strip()
         return Config(
             watch_dir=Path(os.environ.get("STT_WATCH_DIR", "/mnt/d/record")).expanduser(),
             outbox_dir=outbox,
@@ -73,6 +93,17 @@ class Config:
             request_timeout=float(os.environ.get("STT_REQUEST_TIMEOUT", "600")),
             max_retries=int(os.environ.get("STT_MAX_RETRIES", "3")),
             lock_port=int(os.environ.get("STT_LOCK_PORT", "47654")),
+            backend=backend if backend in ("docker", "native") else "docker",
+            results_dir=Path(results_raw).expanduser() if results_raw else None,
+            whisper_model=os.environ.get("WHISPER_MODEL", "large-v3-turbo"),
+            whisper_device=os.environ.get("WHISPER_DEVICE", "cpu"),
+            whisper_compute_type=os.environ.get("WHISPER_COMPUTE_TYPE", "int8"),
+            download_root=download_root or None,
+            claude_model=os.environ.get("CLAUDE_MODEL", "opus"),
+            claude_token=os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", ""),
+            claude_timeout=float(os.environ.get("CLAUDE_TIMEOUT", "600")),
+            summary_prompt=os.environ.get("SUMMARY_PROMPT", ""),
+            auto=os.environ.get("STT_AUTO", "1").strip().lower() not in ("0", "false", "no"),
         )
 
 
@@ -158,6 +189,19 @@ def transcribe(cfg: Config, audio: Path) -> str:
     raise RuntimeError(f"轉譯重試 {cfg.max_retries} 次仍失敗：{last_err}")
 
 
+def _transcribe_native(cfg: Config, audio: Path) -> str:
+    """native 模式：本機 faster-whisper in-process 轉譯（不需 Docker / HTTP）。"""
+    try:
+        from src import stt_engine
+    except ImportError:
+        import stt_engine                       # 打包入口為頂層模組時
+    return stt_engine.transcribe(
+        audio, model=cfg.whisper_model, device=cfg.whisper_device,
+        compute_type=cfg.whisper_compute_type, language=cfg.language,
+        download_root=cfg.download_root,
+    )
+
+
 def write_transcript(cfg: Config, audio: Path, content: str) -> Path:
     """原子化寫入逐字稿（temp → os.replace）。"""
     out = _transcript_path(cfg, audio)
@@ -204,6 +248,26 @@ def clear_progress(cfg: Config, audio: Path) -> None:
         logger.warning("清除進度標記失敗：%s", e)
 
 
+# ── 手動觸發：轉譯請求標記（app 寫入 watch_dir，worker 取走轉譯後消費）──
+
+def _request_path(cfg: Config, audio: Path) -> Path:
+    """某錄音的「轉逐字稿」請求標記（點開頭隱藏檔，不會被 is_candidate 當成音檔）。"""
+    return cfg.watch_dir / f".{audio.stem}.transcribe.request"
+
+
+def transcribe_requested(cfg: Config, audio: Path) -> bool:
+    return _request_path(cfg, audio).exists()
+
+
+def clear_request(cfg: Config, audio: Path) -> None:
+    try:
+        _request_path(cfg, audio).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("清除轉譯請求標記失敗：%s", e)
+
+
 def archive_source(cfg: Config, audio: Path) -> None:
     if cfg.done_dir is None:
         return
@@ -215,10 +279,57 @@ def archive_source(cfg: Config, audio: Path) -> None:
         logger.warning("無法搬移來源檔到 done（可能跨磁碟）：%s — 保留原檔", e)
 
 
+def process_summary(cfg: Config, stem: str) -> None:
+    """native 模式：逐字稿 → 會議紀錄（claude -p）。
+
+    docker 模式此步由 openclaw 容器負責，這裡直接略過。
+    claude 不可用 / 失敗時略過，留待下一輪補掃或前端手動「生成會議紀錄」補跑——
+    錄音與轉譯永不被 claude 卡住。
+    """
+    if cfg.backend != "native" or cfg.results_dir is None:
+        return
+    try:
+        from src import claude_cli
+        from src.prompts import build_summary_prompt
+    except ImportError:
+        import claude_cli                        # 打包入口為頂層模組時
+        from prompts import build_summary_prompt
+
+    out = cfg.results_dir / f"{stem}.md"
+    if out.exists():
+        return                                   # 冪等：已整理過
+    if not claude_cli.available():
+        logger.info("Claude CLI 尚未就緒，暫不整理：%s（逐字稿已保留）", stem)
+        return
+
+    txt = cfg.outbox_dir / f"{stem}.txt"
+    if not txt.exists():
+        return
+
+    logger.info("整理中（claude -p）：%s", stem)
+    t0 = time.time()
+    try:
+        md = claude_cli.run(
+            build_summary_prompt(txt.read_text(encoding="utf-8"), cfg.summary_prompt),
+            model=cfg.claude_model, token=cfg.claude_token, timeout=cfg.claude_timeout,
+        )
+        cfg.results_dir.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(f".{out.name}.part")
+        tmp.write_text(md, encoding="utf-8")
+        os.replace(tmp, out)                     # 原子化落地
+    except claude_cli.ClaudeError as e:
+        logger.warning("整理失敗（%s）：%s — 留待下一輪重試", stem, e)
+        return
+    logger.info("會議紀錄完成：%s（%.1fs）", out.name, time.time() - t0)
+
+
 # ── 主迴圈 ──
 
 def process_file(cfg: Config, audio: Path) -> None:
     if already_done(cfg, audio):
+        return
+    # 手動模式：未收到該檔的「轉逐字稿」請求標記就不處理（等使用者按按鈕）
+    if not cfg.auto and not transcribe_requested(cfg, audio):
         return
     if not is_stable(audio, cfg.stable_seconds):
         logger.debug("檔案尚未穩定，稍後再試：%s", audio.name)
@@ -228,12 +339,16 @@ def process_file(cfg: Config, audio: Path) -> None:
     t0 = time.time()
     write_progress(cfg, audio)          # 標記「開始轉譯」，供前端顯示進度
     try:
-        content = transcribe(cfg, audio)
+        content = _transcribe_native(cfg, audio) if cfg.backend == "native" else transcribe(cfg, audio)
         out = write_transcript(cfg, audio, content)
     finally:
         clear_progress(cfg, audio)      # 不論成功失敗都清掉標記（失敗下輪會重寫）
+        if not cfg.auto:
+            clear_request(cfg, audio)   # 手動：成功 / 失敗都消費請求標記（失敗請重按）
     logger.info("完成：%s → %s（%.1fs）", audio.name, out.name, time.time() - t0)
     archive_source(cfg, audio)
+    if cfg.auto and cfg.backend == "native":
+        process_summary(cfg, audio.stem)   # 全自動 + native：緊接著整理（手動模式留待 app 按鈕）
 
 
 class _Stop:
@@ -265,6 +380,8 @@ def main() -> int:
         return 0
 
     cfg.outbox_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.backend == "native" and cfg.results_dir is not None:
+        cfg.results_dir.mkdir(parents=True, exist_ok=True)
 
     if not cfg.watch_dir.exists():
         logger.error("監看資料夾不存在：%s", cfg.watch_dir)
@@ -274,8 +391,8 @@ def main() -> int:
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: setattr(stop, "flag", True))
 
-    logger.info("啟動 — watch=%s outbox=%s whisper=%s 格式=%s 輪詢=%ss",
-                cfg.watch_dir, cfg.outbox_dir, cfg.whisper_url,
+    logger.info("啟動 — backend=%s watch=%s outbox=%s whisper=%s 格式=%s 輪詢=%ss",
+                cfg.backend, cfg.watch_dir, cfg.outbox_dir, cfg.whisper_url,
                 cfg.response_format, cfg.poll_interval)
 
     while not stop.flag:
@@ -291,6 +408,17 @@ def main() -> int:
                     logger.error("處理 %s 失敗：%s", path.name, e)
         except Exception as e:
             logger.error("輪詢迴圈錯誤：%s", e)
+
+        # native + 全自動：補掃有逐字稿但缺會議紀錄者（手動模式整理一律由 app 按鈕觸發）
+        if cfg.auto and cfg.backend == "native" and cfg.results_dir is not None and not stop.flag:
+            try:
+                for txt in sorted(cfg.outbox_dir.glob("*.txt")):
+                    if stop.flag:
+                        break
+                    if not (cfg.results_dir / f"{txt.stem}.md").exists():
+                        process_summary(cfg, txt.stem)
+            except Exception as e:
+                logger.error("整理補掃錯誤：%s", e)
 
         # 可被中斷的等待
         for _ in range(int(cfg.poll_interval * 10)):

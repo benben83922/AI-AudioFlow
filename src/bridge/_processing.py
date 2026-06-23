@@ -68,14 +68,24 @@ class ProcessingMixin:
         url = self._load_config().get("storage", {}).get("llm_url", "").strip()
         return (url or DEFAULT_LLM_BASE).rstrip("/")
 
+    def _summarize_native(self, transcript: str) -> str:
+        """native 模式：直接呼叫本機 claude -p 整理（不經 llm-service 容器）。"""
+        import src.claude_cli as claude_cli
+        from src.prompts import build_summary_prompt
+        prompt = build_summary_prompt(transcript, self._summary_prompt())   # 自訂 prompt（空＝預設）
+        return claude_cli.run(prompt, model=DEFAULT_LLM_MODEL, token=self._claude_token())
+
     def _summarize_via_llm(self, transcript: str) -> str:
-        """POST 逐字稿到 llm-service 的 OpenAI 相容端點，回傳整理後的 Markdown。"""
+        """整理逐字稿為會議紀錄 Markdown。native 走本機 claude -p；docker 走 llm-service HTTP。"""
+        if self._pipeline_mode() == "native":
+            return self._summarize_native(transcript)
+        from src.prompts import build_summary_prompt
         import httpx
+        # 自訂 prompt（含逐字稿）整段當 user 訊息送（llm-service 後端 = claude -p）
         body = {
             "model": DEFAULT_LLM_MODEL,
             "messages": [
-                {"role": "system", "content": _SUMMARY_SYSTEM},
-                {"role": "user", "content": _SUMMARY_INSTRUCTION + transcript},
+                {"role": "user", "content": build_summary_prompt(transcript, self._summary_prompt())},
             ],
         }
         with httpx.Client(timeout=600) as client:
@@ -84,12 +94,58 @@ class ProcessingMixin:
         data = resp.json()
         return data["choices"][0]["message"]["content"]
 
+    def transcribe_recording(self, filename: str) -> dict:
+        """手動觸發：把某錄音排入轉譯（寫「轉逐字稿」請求標記，由處理 worker 取走）。
+
+        worker 在手動模式下只處理帶此標記的檔；產出逐字稿後標記自動消費。清單會輪詢
+        刷新，完成後該筆自動進到「待整理」（可再按「轉會議紀錄」）。
+        """
+        recordings_dir = self._recordings_dir_path()
+        target = (recordings_dir / filename).resolve()
+        if not str(target).startswith(str(recordings_dir.resolve())):
+            return _err(ErrorType.VALIDATION, "非法的檔案路徑")
+        if not target.exists():
+            return _err(ErrorType.NOT_FOUND, f"找不到錄音：{filename}")
+
+        stem = target.stem
+        # 正在錄這個檔 → 不可轉
+        if (self._recording_filename and Path(self._recording_filename).stem == stem
+                and self._recording_thread and self._recording_thread.is_alive()):
+            return _err(ErrorType.VALIDATION, "此檔正在錄音中")
+        # 已有逐字稿 → 免再轉
+        transcripts_dir = self._transcripts_dir_path()
+        if transcripts_dir and (Path(transcripts_dir) / f"{stem}.txt").exists():
+            return _err(ErrorType.VALIDATION, "逐字稿已存在")
+
+        # 處理 worker 需在跑，且轉譯引擎需就緒（否則標記寫了也轉不動，先給清楚回饋）
+        from src.bridge._worker import _worker_running
+        if not _worker_running():
+            return _err(ErrorType.VALIDATION, "處理服務未啟動，請先於服務頁啟動")
+        if self._pipeline_mode() == "native":
+            from src.bridge._docker import _native_engine_ready
+            if not _native_engine_ready():
+                return _err(ErrorType.VALIDATION, "尚未安裝 faster-whisper，無法轉譯")
+        elif self._container_state() != "running":
+            return _err(ErrorType.DOCKER_UNAVAILABLE, "Whisper 引擎未啟動，請先於服務頁啟動")
+
+        try:
+            (recordings_dir / f".{stem}.transcribe.request").write_text("1", encoding="utf-8")
+        except Exception as e:
+            return _err(ErrorType.INTERNAL, f"無法建立轉譯請求：{e}")
+        logger.info("已排入轉譯：%s", stem)
+        return _ok({"message": "已排入轉譯，稍候自動更新"})
+
     def generate_result(self, stem: str) -> dict:
         """手動把某逐字稿餵 LLM 生成會議紀錄（.md）。背景執行，完成後清單自動刷新顯示。"""
         stem = _safe_stem(stem)
         if stem is None:
             return _err(ErrorType.VALIDATION, "非法的檔名")
-        if not self._claude_token():
+        if self._pipeline_mode() == "native":
+            import src.claude_cli as claude_cli
+            if not claude_cli.available():
+                return _err(ErrorType.VALIDATION,
+                            "未偵測到 Claude CLI，無法生成會議紀錄（請安裝 claude 或於 WSL 登入）")
+        elif not self._claude_token():
             return _err(ErrorType.VALIDATION, "尚未填入 Claude 訂閱 Token，無法生成會議紀錄")
 
         transcripts_dir = self._transcripts_dir_path()

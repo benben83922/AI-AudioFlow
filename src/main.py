@@ -27,39 +27,51 @@ def _is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
-def _ensure_deps(modules: tuple[str, ...] = ("webview", "sounddevice", "soundfile", "httpx")) -> None:
-    """確認執行所需套件，缺了就以當前直譯器自動 `pip install -e .`（僅原始碼模式）。
+def _pip_install(root: Path) -> bool:
+    """以當前直譯器 pip 安裝專案依賴；遇 PEP 668（externally-managed）自動補旗標重試。"""
+    base = [sys.executable, "-m", "pip", "install", "-e", ".", "--disable-pip-version-check"]
+    try:
+        if subprocess.run(base, cwd=str(root)).returncode == 0:
+            return True
+    except Exception as e:
+        print(f"pip 執行失敗：{e}", flush=True)
+    # 現代 Linux 系統 Python 被標 externally-managed（PEP 668）會擋裝；
+    # 補 --break-system-packages --user 重試（裝到使用者目錄，免 root）。
+    print("標準安裝被拒，改用 --break-system-packages --user 重試…", flush=True)
+    try:
+        return subprocess.run(base + ["--break-system-packages", "--user"],
+                              cwd=str(root)).returncode == 0
+    except Exception as e:
+        print(f"重試失敗：{e}", flush=True)
+        return False
 
-    必須在 import 這些重依賴「之前」呼叫——否則 import 失敗會直接讓程式崩潰。
+
+def _ensure_deps(modules: tuple[str, ...] = ("webview", "sounddevice", "soundfile", "numpy", "httpx")) -> None:
+    """確認執行所需套件，缺了就自動 `pip install -e .`（僅原始碼模式）。
+
+    用 find_spec 偵測（不實際 import，避免載入重套件如 faster-whisper/ctranslate2）；
+    缺任一 → 安裝，遇 PEP 668 自動補旗標重試。必須在 import 這些重依賴「之前」呼叫。
     """
     if _is_frozen():
         return
-    try:
-        for m in modules:
-            __import__(m)
-        return                      # 都在 → 無需安裝
-    except ImportError:
-        pass
-
+    import importlib.util
+    missing = [m for m in modules if importlib.util.find_spec(m) is None]
+    if not missing:
+        return
     root = Path(__file__).resolve().parent.parent
-    print("首次啟動：偵測到缺少相依套件，正在自動安裝（僅第一次，需連網，請稍候）…", flush=True)
-    try:
-        r = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-e", ".", "--disable-pip-version-check"],
-            cwd=str(root),
-        )
-    except Exception as e:
-        print(f"自動安裝失敗：{e}\n請手動執行：pip install -e .", flush=True)
-        sys.exit(1)
-    if r.returncode != 0:
-        print("自動安裝失敗，請手動執行：pip install -e .", flush=True)
+    print(f"首次啟動：偵測到缺少套件 {missing}，正在自動安裝（需連網，請稍候）…", flush=True)
+    if not _pip_install(root):
+        print("自動安裝失敗，請手動執行：pip install -e .（必要時加 --break-system-packages）", flush=True)
         sys.exit(1)
     print("相依套件安裝完成，繼續啟動…", flush=True)
 
 
 # worker 模式：不開 GUI，只需輕量依賴（httpx）。在 import worker 前先確認。
 if "--worker" in sys.argv:
-    _ensure_deps(("httpx",))
+    _worker_mods = ["httpx"]
+    if os.environ.get("STT_BACKEND") == "native":
+        _worker_mods.append("faster_whisper")   # native：worker 需本機轉譯引擎
+    _ensure_deps(tuple(_worker_mods))
     try:
         from src.worker_main import main as _worker_main
     except ImportError:

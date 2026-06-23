@@ -7,6 +7,7 @@ import subprocess
 from pathlib import Path
 
 from src.bridge._helpers import _ok
+from src.bridge._platform import detect_platform
 
 logger = logging.getLogger(__name__)
 
@@ -123,20 +124,33 @@ class BridgeBase:
         return Path(p) if p else self._recordings_dir
 
     def _transcripts_dir_path(self) -> Path | None:
-        """逐字稿資料夾（STT worker 輸出）。未明確設定時，依裝置自動偵測
-        WSL 家目錄下的 stt-outbox（與 docker-compose 掛載的 $HOME/stt-outbox 同一處）。"""
+        """逐字稿資料夾（worker 輸出）。未明確設定時：
+            native 模式 → 工作目錄下的 transcripts/（本機原生，無 WSL 掛載）。
+            docker 模式 → 依裝置自動偵測 WSL 家目錄下的 stt-outbox
+                          （與 docker-compose 掛載的 $HOME/stt-outbox 同一處）。
+
+        Windows：一律固定為 WSL 家目錄的 stt-outbox（忽略使用者設定，前端亦唯讀）。"""
+        if detect_platform() == "windows":
+            return self._wsl_native_dir("stt-outbox")
         p = self._load_config()["storage"].get("transcripts_path", "").strip()
         if p:
             return Path(p)
+        if self._pipeline_mode() == "native":
+            return self._data_root / "transcripts"
         return self._wsl_native_dir("stt-outbox")
 
     def _results_dir_path(self) -> Path | None:
         """會議紀錄資料夾（openclaw 輸出）。優先用明確設定；其次由 transcripts_path
         推導同層 openclaw-out；都沒設定則依裝置自動偵測 WSL 家目錄下的 openclaw-out
         （與 docker-compose 掛載的 $HOME/openclaw-out 同一處）。"""
+        # Windows：一律固定為 WSL 家目錄的 openclaw-out（忽略使用者設定，前端亦唯讀）
+        if detect_platform() == "windows":
+            return self._wsl_native_dir("openclaw-out")
         p = self._load_config()["storage"].get("results_path", "").strip()
         if p:
             return Path(p)
+        if self._pipeline_mode() == "native":
+            return self._data_root / "results"
         t = self._load_config()["storage"].get("transcripts_path", "").strip()
         if t:
             return Path(t).parent / "openclaw-out"
@@ -146,10 +160,54 @@ class BridgeBase:
         """首次設定是否已完成（決定 app 啟動時要不要直接拉服務）。"""
         return bool(self._load_config().get("setup_done"))
 
+    # ── 管線模式（Docker 容器 vs 本機原生）──
+
+    def _pipeline_mode(self) -> str:
+        """解析實際管線模式：回傳 'docker' 或 'native'。
+
+        設定 pipeline.mode：
+            'docker' → 一律走 whisper 容器 + llm-service/openclaw（需 Docker/WSL）。
+            'native' → 一律走本機 faster-whisper + claude -p（不需 Docker）。
+            'auto'（預設）→ Docker 可用就 docker，否則退回 native。
+        讓既有 Windows+Docker 安裝維持原行為，純 Linux / 無 Docker 自動走原生。
+        """
+        mode = (self._load_config().get("pipeline", {}).get("mode", "auto") or "auto").lower()
+        if mode in ("docker", "native"):
+            return mode
+        try:
+            state, _ = self._docker_state()   # DockerMixin 提供（runtime 解析）
+        except Exception:
+            state = "not_installed"
+        return "docker" if state == "ok" else "native"
+
+    def _summary_prompt(self) -> str:
+        """使用者自訂的「會議紀錄」prompt（空字串＝用 prompts.DEFAULT_SUMMARY_PROMPT）。"""
+        return self._load_config().get("summary", {}).get("prompt", "").strip()
+
+    def _auto_pipeline(self) -> bool:
+        """是否「自動」處理整條管線（錄音→逐字稿→會議紀錄全自動）。
+
+        預設 False＝改為每個檔案手動觸發：使用者於清單按「轉逐字稿」才轉譯、
+        按「轉會議紀錄」才整理。設 pipeline.auto=true 可回到全自動。
+        """
+        return bool(self._load_config().get("pipeline", {}).get("auto", False))
+
     @staticmethod
     def _default_config() -> dict:
         return {
             "setup_done": False,
+            "pipeline": {
+                "mode": "auto",            # auto | docker | native
+                "auto": False,             # False＝每檔手動按鈕觸發；True＝全自動
+            },
+            "stt": {                       # native 模式的 faster-whisper 參數
+                "model": "large-v3-turbo",
+                "device": "cpu",
+                "compute_type": "int8",
+            },
+            "summary": {                   # 會議紀錄 prompt（空＝用預設）
+                "prompt": "",
+            },
             "api_keys": {
                 "whisper": "",
                 "claude": "",

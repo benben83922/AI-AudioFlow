@@ -45,6 +45,15 @@ SERVICE_META = {
     "openclaw":    {"name": "OpenClaw 整理",     "desc": "逐字稿 → 會議紀錄 Markdown"},
 }
 
+# native 模式：沿用相同四個 key（前端服務頁共用），但語意改為本機原生引擎。
+# whisper/llm_service/openclaw 為「偵測/衍生」狀態，無獨立程序可啟停，唯一可控的是 worker。
+NATIVE_SERVICE_META = {
+    "whisper":     {"name": "轉譯引擎",        "desc": "本機 faster-whisper（in-process，無需 Docker）"},
+    "stt_worker":  {"name": "處理服務",        "desc": "監看錄音 → 轉譯 → 整理（背景 pipeline）"},
+    "llm_service": {"name": "Claude 整理引擎",  "desc": "claude -p（雙偵測：原生優先、WSL 後備）"},
+    "openclaw":    {"name": "自動整理",        "desc": "逐字稿 → 會議紀錄（內建於處理服務）"},
+}
+
 _CREATE_NO_WINDOW = 0x08000000  # Windows：不閃主控台視窗
 
 
@@ -217,6 +226,11 @@ class ServicesMixin:
         if self._services_cache and now - self._services_cache[0] < 2.5:
             return _ok(self._services_cache[1])
 
+        if self._pipeline_mode() == "native":
+            out = self._services_status_native()
+            self.__class__._services_cache = (now, out)
+            return _ok(out)
+
         docker_state, docker_msg = self._docker_state()
         docker_ok = docker_state == "ok"
 
@@ -241,11 +255,78 @@ class ServicesMixin:
         self.__class__._services_cache = (now, out)
         return _ok(out)
 
+    def _services_status_native(self) -> dict:
+        """native 模式服務狀態（前端服務頁共用 key）。
+
+        只有 stt_worker 是可啟停的真實程序；whisper（faster-whisper 引擎）、
+        llm_service（claude -p）為偵測型引擎，標 detectable_only（前端只給「重新偵測」）。
+        不含 openclaw —— 那是 Docker 版的自動整理容器，native + 手動模式用不到
+        （整理改由「轉會議紀錄」按鈕直接呼叫 claude）。
+        """
+        try:
+            from src.bridge._docker import _native_engine_ready
+            engine_ok = _native_engine_ready()
+        except Exception:
+            engine_ok = False
+        try:
+            import src.claude_cli as claude_cli
+            claude_ok = claude_cli.available()
+        except Exception:
+            claude_ok = False
+        worker_up = _worker_running()
+        starting = "stt_worker" in self._starting
+
+        def _card(key, running, status, message=""):
+            m = NATIVE_SERVICE_META[key]
+            return {"key": key, "name": m["name"], "description": m["desc"],
+                    "running": running, "status": status, "message": message,
+                    "detectable_only": key != "stt_worker"}
+
+        return {
+            "whisper": _card("whisper", engine_ok, "running" if engine_ok else "absent",
+                             "" if engine_ok else "需安裝 faster-whisper"),
+            "stt_worker": _card("stt_worker", worker_up,
+                                "running" if worker_up else ("starting" if starting else "stopped")),
+            "llm_service": _card("llm_service", claude_ok, "running" if claude_ok else "absent",
+                                 "" if claude_ok else "未偵測到 Claude CLI"),
+        }
+
+    def redetect_services(self) -> dict:
+        """重新偵測本機引擎（faster-whisper / claude CLI），清快取後回傳最新服務狀態。
+
+        給前端偵測型引擎卡片的「重新偵測」鈕用（裝好 faster-whisper / claude 後即時反映）。
+        """
+        try:
+            import src.claude_cli as claude_cli
+            claude_cli.detect(force=True)
+        except Exception:
+            pass
+        self.__class__._services_cache = None
+        return self.get_services_status()
+
     def get_system_health(self) -> dict:
         """單一健康指示：把四個服務濃縮成一句白話狀態，給側邊欄 / 服務頁用。
 
         level: ready（全部就緒）| starting（啟動中）| attention（需處理）
         """
+        if self._pipeline_mode() == "native":
+            worker_up = _worker_running()
+            try:
+                import src.claude_cli as claude_cli
+                claude_ok = claude_cli.available()
+            except Exception:
+                claude_ok = False
+            running = (1 if worker_up else 0) + (1 if claude_ok else 0)
+            if worker_up:
+                level = "ready"
+                message = ("系統就緒，可開始錄音" if claude_ok
+                           else "可錄音與轉譯；未偵測到 Claude CLI，逐字稿不會自動整理")
+            elif "stt_worker" in self._starting:
+                level, message = "starting", "處理服務啟動中…"
+            else:
+                level, message = "attention", "處理服務未啟動"
+            return _ok({"level": level, "message": message, "running": running, "total": 2})
+
         status = self.get_services_status()["data"]
         services = list(status.values())
         running = sum(1 for s in services if s["running"])
@@ -290,7 +371,10 @@ class ServicesMixin:
         - whisper / llm_service / openclaw：需 Docker 已安裝且執行中。
         - llm_service / openclaw（compose 服務）：Windows 下另需 WSL 就緒。
         - stt_worker：無硬性前置依賴（可獨立拉起；轉譯需 whisper，但不擋啟動）。
+        - native 模式：全程本機原生，無 Docker/WSL 前置依賴。
         """
+        if self._pipeline_mode() == "native":
+            return True, ""
         if key == "stt_worker":
             return True, ""
 
@@ -313,6 +397,10 @@ class ServicesMixin:
     def start_service(self, key: str) -> dict:
         if key not in SERVICE_META:
             return _err(ErrorType.VALIDATION, f"未知服務：{key}")
+
+        # native：唯一可控的是處理 worker；其餘為本機引擎的偵測/衍生狀態
+        if self._pipeline_mode() == "native" and key != "stt_worker":
+            return _ok({"message": f"{NATIVE_SERVICE_META[key]['name']}為本機引擎，無需啟動"})
 
         ok, msg = self._service_deps_ok(key)
         if not ok:
@@ -346,6 +434,9 @@ class ServicesMixin:
             return _err(ErrorType.VALIDATION, f"未知服務：{key}")
         self.__class__._services_cache = None
 
+        if self._pipeline_mode() == "native" and key != "stt_worker":
+            return _ok({"message": f"{NATIVE_SERVICE_META[key]['name']}為本機引擎，無需停止"})
+
         if key == "whisper":
             ok = self.stop_stt_container()
             return _ok({"message": "Whisper 已停止"}) if ok else _err(ErrorType.INTERNAL, "停止 Whisper 失敗")
@@ -375,7 +466,15 @@ class ServicesMixin:
     def start_all_services_async(self) -> None:
         """app 啟動時呼叫：四個服務一起拉起，各自先判斷是否已在執行。"""
         def _run():
-            for key in SERVICE_ORDER:
+            # native 只需拉處理 worker；docker 模式起容器服務。手動模式不起 openclaw
+            # （自動整理器）——整理改由 app 的「轉會議紀錄」按鈕（generate_result）觸發。
+            if self._pipeline_mode() == "native":
+                keys = ("stt_worker",)
+            elif self._auto_pipeline():
+                keys = SERVICE_ORDER
+            else:
+                keys = tuple(k for k in SERVICE_ORDER if k != "openclaw")
+            for key in keys:
                 try:
                     self.start_service(key)
                 except Exception as e:
@@ -407,6 +506,14 @@ class ServicesMixin:
 
     def stop_all_services_sync(self) -> None:
         """同步停止全部背景服務並等待完成（關閉流程用，期間前端顯示轉圈）。"""
+        if self._pipeline_mode() == "native":
+            # native 只有處理 worker 一個程序，無容器 / compose 可停
+            try:
+                self.stop_worker()
+            except Exception as e:
+                logger.error("停止處理 worker 失敗：%s", e)
+            self.__class__._services_cache = None
+            return
         try:
             self.stop_worker()
         except Exception as e:
