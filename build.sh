@@ -25,16 +25,20 @@ echo "[1/2] 產生內嵌資產（compose 內容，供 docker 模式；native 模
 "$PY" scripts/gen_bundled_assets.py
 
 echo "[2/2] Nuitka 打包（單一執行檔）…"
-# 收錄重點（與 Windows 版一致的跨平台部分）：
+export CC=gcc CXX=g++
+# 收錄重點：
 #   - src（含 _bundled_assets）、前端
-#   - native 轉譯引擎：faster_whisper / ctranslate2 / onnxruntime / av / tokenizers / numpy（含資料檔/.so）
-#   - 錄音：sounddevice（程式碼；執行庫 libportaudio2 屬系統套件）、soundfile（wheel 多含 libsndfile）
-#   - GUI：gi（PyGObject）；WebKit2/GTK 的 typelib 與 .so 屬系統套件，需目標機自備
-# 註：不收 pyaudiowpatch / clr_loader / pythonnet（那些是 Windows 專用）。
+#   - native 轉譯引擎：faster_whisper / ctranslate2 / onnxruntime / av / tokenizers / numpy
+#   - 錄音：sounddevice / soundfile
+#   - GUI：PyQt6（QtWebEngine）用 --enable-plugin=pyqt6 自動收齊
+#     GTK/WebKit2GTK 與系統深度整合無法內嵌，改用可打包的 PyQt6 後端。
+# 不收：pyaudiowpatch / clr_loader / pythonnet（Windows 專用）
 "$PY" -m nuitka \
   --standalone \
   --onefile \
   --assume-yes-for-downloads \
+  --static-libpython=no \
+  --enable-plugin=pyqt6 \
   --include-package=src \
   --include-data-dir=src/frontend=src/frontend \
   --include-package=faster_whisper \
@@ -48,8 +52,29 @@ echo "[2/2] Nuitka 打包（單一執行檔）…"
   --include-package=tokenizers \
   --include-package=numpy \
   --include-package=sounddevice \
-  --include-package-data=soundfile \
-  --include-package=gi \
+  --include-package=soundfile \
+  --nofollow-import-to=torch \
+  --nofollow-import-to=torchaudio \
+  --nofollow-import-to=torchvision \
+  --nofollow-import-to=nvidia \
+  --nofollow-import-to=triton \
+  --nofollow-import-to=transformers \
+  --nofollow-import-to=diffusers \
+  --nofollow-import-to=accelerate \
+  --nofollow-import-to=sympy \
+  --nofollow-import-to=mpmath \
+  --nofollow-import-to=pytest \
+  --nofollow-import-to=_pytest \
+  --nofollow-import-to=setuptools \
+  --nofollow-import-to=pkg_resources \
+  --nofollow-import-to=distutils \
+  --nofollow-import-to=unittest \
+  --nofollow-import-to=matplotlib \
+  --nofollow-import-to=scipy \
+  --nofollow-import-to=pandas \
+  --nofollow-import-to=IPython \
+  --nofollow-import-to=jupyter \
+  --nofollow-import-to=notebook \
   --output-dir=dist \
   --output-filename=AudioFlow.bin \
   app.py

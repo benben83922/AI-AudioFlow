@@ -45,4 +45,7 @@ results/
 
 # 打包前置自動生成（compose 內嵌）；勿進版控，build 時重生
 src/_bundled_assets.py
+
+# Nuitka 建置錯誤報告
+nuitka-crash-report.xml
 PLAUD_Note_Pro_Reverse_Engineering.md

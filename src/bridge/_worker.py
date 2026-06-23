@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 from src.bridge._helpers import _ok
-from src.bridge._platform import detect_platform, uses_windows_host, WINDOWS, WSL
+from src.bridge._platform import detect_platform, uses_windows_host, is_windows, WINDOWS, WSL
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +34,10 @@ def _worker_running(port: int = WORKER_LOCK_PORT, pid_file: "Path | None" = None
 
     Windows 側 worker 的單例鎖 port 用 listen(1) 且從不 accept()，connect_ex 連一次
     就塞滿 backlog，導致後續全部被拒，故改查監聽狀態：
-        - Windows / WSL2：powershell.exe Get-NetTCPConnection（WSL 走 .exe interop）。
-        - 純 Linux：試綁同一 port 判斷是否已被占用（無 Windows 主機可問）。
+        - 純 Windows：powershell.exe Get-NetTCPConnection（worker 跑在 Windows 側）。
+        - WSL / 純 Linux：試綁同一 port（worker 跑在 Linux 側，Windows 主機看不到此 port）。
     """
-    if uses_windows_host():
+    if is_windows():
         return _win_port_listening(port)
     return _linux_port_listening(port)
 
