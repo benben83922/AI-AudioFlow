@@ -30,36 +30,37 @@ services:
       retries: 3
       start_period: 10s
 
-  # ── 權限初始化：openclaw 以 uid 1000 執行，但 bind mount 的輸出目錄常被 Docker 以
-  #    root 自動建立，導致 openclaw 寫不進去。先用 root 把擁有者改成 openclaw 的執行身分，
-  #    跑完即退出（openclaw 等它成功後才啟動）。 ──
-  init-perms:
-    image: busybox
-    user: root
-    volumes:
-      - ${HOME}/openclaw-out:/out        # 整理結果輸出目錄（需可寫）；$HOME 依當前裝置自動帶出
-    command: sh -c "chown -R ${HOST_UID:-1000}:${HOST_GID:-1000} /out"
-    restart: "no"
-
-  # ── OpenClaw：輪詢逐字稿 → 呼叫 LLM 服務 → 原子化寫出。檔案歸它。 ──
-  openclaw:
-    build: ./openclaw
-    # 以你的 WSL uid:gid 執行，寫出的檔屬於你、不會變 root
-    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
-    environment:
-      LLM_BASE_URL: http://llm-service:8088/v1   # 同 network，用容器名互連
-      LLM_MODEL: ${CLAUDE_MODEL:-opus}
-      POLL_INTERVAL: "10"
-    volumes:
-      - ${HOME}/stt-outbox:/in:ro        # 逐字稿，唯讀（最小權限）；$HOME 依當前裝置自動帶出
-      - ${HOME}/openclaw-out:/out        # 整理結果，可寫
-    depends_on:
-      llm-service:
-        condition: service_healthy               # 等 LLM 服務健康才啟動
-      init-perms:
-        condition: service_completed_successfully # 等權限修好才啟動
-    restart: unless-stopped
-    networks: [audioflow]
+  # ── openclaw（+ 只服務於它的 init-perms）已停用：目前不需要自動整理容器，
+  #    逐字稿 → 會議紀錄改由 app 的「轉會議紀錄」按鈕（generate_result）觸發。
+  #    需要時整段取消註解即可恢復。 ──
+  # init-perms:
+  #   # 權限初始化：openclaw 以 uid 1000 執行，bind mount 輸出目錄常被 Docker 以 root
+  #   # 建立，導致寫不進去。先用 root 改擁有者，跑完即退出（openclaw 等它成功才啟動）。
+  #   image: busybox
+  #   user: root
+  #   volumes:
+  #     - ${HOME}/openclaw-out:/out
+  #   command: sh -c "chown -R ${HOST_UID:-1000}:${HOST_GID:-1000} /out"
+  #   restart: "no"
+  #
+  # openclaw:
+  #   # 輪詢逐字稿 → 呼叫 LLM 服務 → 原子化寫出。
+  #   build: ./openclaw
+  #   user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+  #   environment:
+  #     LLM_BASE_URL: http://llm-service:8088/v1
+  #     LLM_MODEL: ${CLAUDE_MODEL:-opus}
+  #     POLL_INTERVAL: "10"
+  #   volumes:
+  #     - ${HOME}/stt-outbox:/in:ro
+  #     - ${HOME}/openclaw-out:/out
+  #   depends_on:
+  #     llm-service:
+  #       condition: service_healthy
+  #     init-perms:
+  #       condition: service_completed_successfully
+  #   restart: unless-stopped
+  #   networks: [audioflow]
 
 networks:
   audioflow:

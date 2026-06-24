@@ -41,6 +41,28 @@ def _progress_markers(dir_) -> dict:
     return out
 
 
+def _error_markers(dir_, suffix: str) -> dict:
+    """讀資料夾內 .<stem><suffix> 失敗標記，回傳 {stem: {error, ts, stage}}。
+
+    worker / app 在轉譯或整理失敗時寫入；用來把該筆顯示成「失敗」並提供重試。
+    """
+    out: dict = {}
+    if dir_ is None:
+        return out
+    try:
+        for p in Path(dir_).iterdir():
+            name = p.name
+            if name.startswith(".") and name.endswith(suffix):
+                stem = name[1:-len(suffix)]
+                try:
+                    out[stem] = json.loads(p.read_text(encoding="utf-8"))
+                except Exception:
+                    out[stem] = {"error": ""}
+    except Exception:
+        pass
+    return out
+
+
 def _calc_progress(marker: dict | None) -> dict | None:
     """由進度標記算出顯示用進度：active（轉譯中）/ 排隊中、已耗時、估算 %。"""
     if marker is None:
@@ -558,6 +580,8 @@ class RecordingMixin:
         md_stems = _stems_in(self._results_dir_path(), ".md")
         markers = _progress_markers(transcripts_dir)   # worker 寫的轉譯進度標記
         requested = _request_stems(recordings_dir)      # 已按「轉逐字稿」、排入佇列的 stem
+        tx_errors = _error_markers(transcripts_dir, ".transcribe.error")   # 轉譯失敗
+        sum_errors = _error_markers(self._results_dir_path(), ".summary.error")  # 整理失敗
         generating = getattr(self, "_generating", set())  # 正在生成會議紀錄的 stem
         active_stem = (
             Path(self._recording_filename).stem
@@ -584,17 +608,33 @@ class RecordingMixin:
             has_transcript = stem in txt_stems
             has_result = stem in md_stems
             progress = None
+            error = None
             if active_stem and stem == active_stem:
                 status = "recording"
             elif has_result:
                 status = "done"
             elif has_transcript:
-                # 有逐字稿、缺會議紀錄 → 待整理（手動模式等使用者按「轉會議紀錄」）
-                status = "summarizing"
+                if stem in generating:
+                    # 正在生成會議紀錄（generating 旗標另外帶，供前端轉圈）
+                    status = "summarizing"
+                elif stem in sum_errors:
+                    # 整理失敗 → 失敗（前端顯示錯誤 + 「重試整理」）
+                    status = "failed"
+                    error = {"stage": "summary",
+                             "message": (sum_errors.get(stem) or {}).get("error", "")}
+                else:
+                    # 有逐字稿、缺會議紀錄 → 待整理（手動模式等使用者按「轉會議紀錄」）
+                    status = "summarizing"
             elif stem in markers or stem in requested:
                 # 已排入 / 正在轉譯：有進度標記 → 估 %，僅有請求標記 → 排隊中
+                # （重試時請求標記優先於殘留錯誤標記，故先判斷此分支）
                 status = "transcribing"
                 progress = _calc_progress(markers.get(stem))
+            elif stem in tx_errors:
+                # 轉譯失敗 → 失敗（前端顯示錯誤 + 「重試轉譯」）
+                status = "failed"
+                error = {"stage": "transcribe",
+                         "message": (tx_errors.get(stem) or {}).get("error", "")}
             else:
                 # 尚無逐字稿、也未排入 → 待轉譯（手動模式等使用者按「轉逐字稿」）
                 status = "pending"
@@ -607,6 +647,7 @@ class RecordingMixin:
                 "duration": _wav_duration(path),
                 "status": status,
                 "progress": progress,
+                "error": error,                     # 失敗時 {stage, message}，否則 None
                 "has_transcript": has_transcript,
                 "has_result": has_result,
                 "generating": stem in generating,   # 會議紀錄生成中（供前端顯示轉圈）
@@ -615,6 +656,47 @@ class RecordingMixin:
             })
 
         return _ok(items)
+
+    # ── 在系統檔案管理器開啟資料夾 / 選取檔案 ──
+
+    def reveal_path(self, path_str: str) -> dict:
+        """在系統檔案管理器開啟資料夾，或選取某檔案。Windows→explorer、WSL→explorer.exe、Linux→xdg-open。"""
+        from src.bridge._platform import detect_platform, WINDOWS, WSL
+        p = Path(path_str)
+        if not p.exists():
+            return _err(ErrorType.NOT_FOUND, f"路徑不存在：{path_str}")
+        plat = detect_platform()
+        try:
+            if plat == WINDOWS:
+                args = ["explorer.exe", str(p)] if p.is_dir() else ["explorer.exe", "/select,", str(p)]
+                subprocess.Popen(args, creationflags=0x08000000)
+            elif plat == WSL:
+                win = subprocess.run(["wslpath", "-w", str(p)], capture_output=True, text=True,
+                                     encoding="utf-8", errors="replace", timeout=5).stdout.strip()
+                args = ["explorer.exe", win] if p.is_dir() else ["explorer.exe", "/select,", win]
+                subprocess.Popen(args)
+            else:
+                subprocess.Popen(["xdg-open", str(p if p.is_dir() else p.parent)])
+            return _ok({"message": "已開啟資料夾"})
+        except Exception as e:
+            return _err(ErrorType.INTERNAL, f"無法開啟資料夾：{e}")
+
+    def open_folder(self, kind: str) -> dict:
+        """開啟三段資料夾之一（recordings / transcripts / results）。"""
+        getter = {"recordings": self._recordings_dir_path,
+                  "transcripts": self._transcripts_dir_path,
+                  "results": self._results_dir_path}.get(kind)
+        if getter is None:
+            return _err(ErrorType.VALIDATION, f"未知資料夾：{kind}")
+        path = getter()
+        if not path:
+            return _err(ErrorType.VALIDATION, "資料夾尚未設定")
+        p = Path(path)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        return self.reveal_path(str(p))
 
     def delete_recording(self, filename: str) -> dict:
         config = self._load_config()

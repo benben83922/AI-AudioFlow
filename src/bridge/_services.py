@@ -29,10 +29,11 @@ from src.bridge._worker import _worker_running
 logger = logging.getLogger(__name__)
 
 # 前端 key → docker compose 服務名
-COMPOSE_SVC = {"llm_service": "llm-service", "openclaw": "openclaw"}
+COMPOSE_SVC = {"llm_service": "llm-service"}   # openclaw 已停用（見下）
 
 # 啟動順序（whisper / worker 先就緒，再起下游 compose）
-SERVICE_ORDER = ("whisper", "stt_worker", "llm_service", "openclaw")
+# openclaw 已停用：整理改由 app 的「轉會議紀錄」按鈕（generate_result）觸發，不需自動整理容器。
+SERVICE_ORDER = ("whisper", "stt_worker", "llm_service")   # , "openclaw"
 
 # 「系統就緒」只看核心服務（錄音→逐字稿）。LLM／openclaw 需使用者填 Claude token
 # 才會啟動，未填屬正常狀態，不應讓整體健康卡在「未就緒」，故不納入核心。
@@ -42,7 +43,7 @@ SERVICE_META = {
     "whisper":     {"name": "Whisper 語音引擎", "desc": "本地語音轉文字容器（port 9000）"},
     "stt_worker":  {"name": "STT Worker",       "desc": "監看錄音資料夾並送轉譯"},
     "llm_service": {"name": "LLM 服務",          "desc": "OpenAI 相容介面，後端 claude -p"},
-    "openclaw":    {"name": "OpenClaw 整理",     "desc": "逐字稿 → 會議紀錄 Markdown"},
+    # "openclaw":    {"name": "OpenClaw 整理",     "desc": "逐字稿 → 會議紀錄 Markdown"},   # 已停用
 }
 
 # native 模式：沿用相同四個 key（前端服務頁共用），但語意改為本機原生引擎。
@@ -51,7 +52,7 @@ NATIVE_SERVICE_META = {
     "whisper":     {"name": "轉譯引擎",        "desc": "本機 faster-whisper（in-process，無需 Docker）"},
     "stt_worker":  {"name": "處理服務",        "desc": "監看錄音 → 轉譯 → 整理（背景 pipeline）"},
     "llm_service": {"name": "Claude 整理引擎",  "desc": "claude -p（雙偵測：原生優先、WSL 後備）"},
-    "openclaw":    {"name": "自動整理",        "desc": "逐字稿 → 會議紀錄（內建於處理服務）"},
+    # "openclaw":    {"name": "自動整理",        "desc": "逐字稿 → 會議紀錄（內建於處理服務）"},   # 已停用
 }
 
 _CREATE_NO_WINDOW = 0x08000000  # Windows：不閃主控台視窗
@@ -62,6 +63,7 @@ class ServicesMixin:
 
     _compose_lock = threading.Lock()
     _services_cache: tuple[float, dict] | None = None  # (時間, status dict)
+    _wsl_docker_cache: tuple[float, bool, str] | None = None  # (時間, ok, message)
     _shutting_down = False  # 關閉流程已確認 → 放行視窗關閉
     _starting: set = set()  # 正在啟動中的服務 key（讓前端顯示「啟動中」）
 
@@ -97,6 +99,40 @@ class ServicesMixin:
             kwargs = {"cwd": str(compose_root), "env": env}
         return subprocess.run(cmd, capture_output=True, text=True,
                               encoding="utf-8", errors="replace", timeout=timeout, **kwargs)
+
+    def _wsl_docker_ok(self) -> tuple[bool, str]:
+        """Windows：WSL 內的 docker 是否連得到引擎（compose 服務走 WSL，需此就緒）。
+
+        Docker Desktop 引擎在 Windows 端可連（whisper 直接用 docker.exe），但若沒對
+        當前 WSL distro 開「WSL 整合」，`wsl docker` 會連不到引擎（/var/run/docker.sock
+        不存在），導致 compose 服務（llm-service / openclaw）起不來、錯誤只埋在日誌裡。
+        提前探測，給清楚可行動的回饋。含 10 秒快取，避免每次啟動都跑 wsl。
+        """
+        now = time.time()
+        cached = self.__class__._wsl_docker_cache
+        if cached and now - cached[0] < 10.0:
+            return cached[1], cached[2]
+
+        hint = ("WSL 內連不到 Docker 引擎：請開啟 Docker Desktop → Settings → Resources → "
+                "WSL Integration，啟用目前的 WSL 發行版後 Apply & Restart，再重試。")
+        ok, msg = False, ""
+        try:
+            r = subprocess.run(
+                ["wsl", "-e", "bash", "-lc", "docker info --format '{{.ServerVersion}}'"],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=15, creationflags=_CREATE_NO_WINDOW,
+            )
+            if r.returncode == 0 and (r.stdout or "").strip():
+                ok = True
+            else:
+                msg = hint
+                logger.warning("WSL 內 docker info 失敗：%s", (r.stderr or "").strip()[:200])
+        except Exception as e:
+            msg = hint
+            logger.warning("WSL docker 預檢執行失敗：%s", e)
+
+        self.__class__._wsl_docker_cache = (now, ok, msg)
+        return ok, msg
 
     def _compose_status_all(self) -> dict:
         """一次查回所有 compose 服務的運行狀態：{compose 服務名: running_bool}。"""
@@ -304,6 +340,67 @@ class ServicesMixin:
         self.__class__._services_cache = None
         return self.get_services_status()
 
+    def get_pipeline_info(self) -> dict:
+        """目前管線模式：mode（native/docker）+ auto（全自動 / 逐檔手動）。供錄音頁流程圖顯示。"""
+        return _ok({"mode": self._pipeline_mode(), "auto": self._auto_pipeline()})
+
+    def set_pipeline_auto(self, auto) -> dict:
+        """切換全自動 / 逐檔手動。改 config 後重啟處理 worker 讓 STT_AUTO 生效。"""
+        auto = bool(auto)
+        cfg = self._load_config()
+        cfg.setdefault("pipeline", {})["auto"] = auto
+        self._save_config(cfg)
+        try:
+            if _worker_running():
+                self.stop_worker()
+                self.start_worker_detached()
+        except Exception as e:
+            logger.warning("切換自動模式後重啟 worker 失敗：%s", e)
+        return _ok({"auto": auto,
+                    "message": "自動處理已開啟（錄完自動轉譯並整理）" if auto
+                               else "已切換為逐檔手動（自行按轉逐字稿 / 轉會議紀錄）"})
+
+    def get_log(self, source: str = "worker", lines: int = 300) -> dict:
+        """讀取某來源的最近日誌，給「日誌」分頁用。
+
+        來源：
+            worker      → 處理 worker 的 log 檔（detached 程序無主控台，寫在 _data_root/worker.log）
+            whisper     → docker logs（whisper 容器；native 模式無此來源）
+            llm_service → docker compose logs llm-service
+            openclaw    → docker compose logs openclaw
+        回傳 {source, text, available, message}。
+        """
+        n = max(20, min(int(lines or 300), 2000))
+        try:
+            if source == "worker":
+                path = getattr(self, "_data_root", self._project_root) / "worker.log"
+                if not path.exists():
+                    return _ok({"source": source, "text": "", "available": False,
+                                "message": f"尚無日誌（worker 尚未產生 {path.name}）"})
+                data = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                return _ok({"source": source, "text": "\n".join(data[-n:]), "available": True})
+
+            # 以下為容器日誌；native 模式無容器
+            if self._pipeline_mode() == "native":
+                return _ok({"source": source, "text": "", "available": False,
+                            "message": "native（免 Docker）模式無容器日誌，僅有處理 worker 日誌"})
+
+            if source == "whisper":
+                from src.bridge._docker import _run_docker, STT_CONTAINER
+                r = _run_docker(["logs", "--tail", str(n), STT_CONTAINER], timeout=20)
+                text = ((r.stdout or "") + (r.stderr or "")).strip()
+                return _ok({"source": source, "text": text, "available": True})
+
+            if source in COMPOSE_SVC:
+                r = self._run_compose(["logs", "--tail", str(n), "--no-color", COMPOSE_SVC[source]],
+                                      timeout=40)
+                text = ((r.stdout or "") + (r.stderr or "")).strip()
+                return _ok({"source": source, "text": text, "available": True})
+
+            return _err(ErrorType.VALIDATION, f"未知的日誌來源：{source}")
+        except Exception as e:
+            return _err(ErrorType.INTERNAL, f"讀取日誌失敗：{e}")
+
     def get_system_health(self) -> dict:
         """單一健康指示：把四個服務濃縮成一句白話狀態，給側邊欄 / 服務頁用。
 
@@ -388,6 +485,13 @@ class ServicesMixin:
             w_state, wmsg = self._wsl_state()
             if w_state != "ok":
                 return False, wmsg or "WSL 未就緒，無法啟動此服務"
+            # Windows：compose 服務在 WSL 內跑，需 WSL 內 docker 連得到引擎
+            # （Docker Desktop 的 WSL 整合）。whisper 走 docker.exe 不受此影響，故
+            # 只在這兩個 compose 服務的啟動前把關，避免 compose up 深處才失敗。
+            if sys.platform == "win32":
+                wd_ok, wd_msg = self._wsl_docker_ok()
+                if not wd_ok:
+                    return False, wd_msg
             # LLM 需 Claude 訂閱 token；openclaw 依賴 LLM，故同樣需要
             if not self._claude_token():
                 return False, "請先在設定填入 Claude 訂閱 Token（claude setup-token）才能啟動 LLM／OpenClaw"

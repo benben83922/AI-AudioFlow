@@ -8,17 +8,17 @@ import os
 import re
 import sys
 import signal
-import socket
 import logging
 import subprocess
 from pathlib import Path
 
+from src import stt_lock
 from src.bridge._helpers import _ok
-from src.bridge._platform import detect_platform, uses_windows_host, is_windows, WINDOWS, WSL
+from src.bridge._platform import detect_platform, WINDOWS, WSL
 
 logger = logging.getLogger(__name__)
 
-WORKER_LOCK_PORT = 47654          # 與 worker_main.py 的 STT_LOCK_PORT 預設一致
+WORKER_LOCK_PORT = stt_lock.DEFAULT_LOCK_PORT   # 單例鎖 base port（worker 可能漂移）
 DEFAULT_WHISPER_URL = "http://localhost:9000"
 DEFAULT_LANGUAGE = "zh"
 _CREATE_NO_WINDOW = 0x08000000    # Windows：不閃主控台視窗
@@ -29,53 +29,33 @@ def _is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
 
 
-def _worker_running(port: int = WORKER_LOCK_PORT, pid_file: "Path | None" = None) -> bool:
-    """worker 是否在跑（靠它的單例鎖 port 判斷）。
+def _onefile_binary() -> str:
+    """打包後「自己」的執行檔絕對路徑，用來重新拉起 worker。
 
-    Windows 側 worker 的單例鎖 port 用 listen(1) 且從不 accept()，connect_ex 連一次
-    就塞滿 backlog，導致後續全部被拒，故改查監聽狀態：
-        - 純 Windows：powershell.exe Get-NetTCPConnection（worker 跑在 Windows 側）。
-        - WSL / 純 Linux：試綁同一 port（worker 跑在 Linux 側，Windows 主機看不到此 port）。
+    Nuitka onefile 下 `sys.executable` 在 Linux 會指向解壓暫存夾裡並不存在的
+    `python3`（Windows 才剛好指向 exe 本體），直接拿來 spawn 會噴
+    `[Errno 2] No such file or directory: /tmp/onefile_xxx/python3`。
+    Nuitka 會把 onefile 執行檔的絕對路徑放在環境變數 NUITKA_ONEFILE_BINARY，
+    優先採用；退而求其次才用 argv[0]（轉絕對路徑，因 worker 會換 cwd）。
     """
-    if is_windows():
-        return _win_port_listening(port)
-    return _linux_port_listening(port)
+    return (
+        os.environ.get("NUITKA_ONEFILE_BINARY")
+        or (sys.argv and os.path.abspath(sys.argv[0]))
+        or sys.executable
+    )
 
 
-def _linux_port_listening(port: int) -> bool:
-    """純 Linux：嘗試綁定 port 判斷 worker 是否在執行。
+def _worker_running(port: "int | None" = None, pid_file: "Path | None" = None) -> bool:
+    """worker 是否在跑：靠單例鎖 port 上的握手字串辨識（見 stt_lock）。
 
-    worker（worker_main.py）啟動時會「不設 SO_REUSEADDR」獨佔綁定此 port 當單例鎖。
-    這裡同樣試綁：綁得起來 → 沒人聽 → worker 未執行；EADDRINUSE → worker 在跑。
-    測試 socket 立即關閉，不影響 worker。
+    指定 port → 只探測該 port；否則掃描漂移範圍 [base, base+span)，靠握手認出
+    「我們的 worker」。握手辨識可避免「陌生程式剛好佔同一 port」被誤判成 worker
+    在跑（舊版只查 port 是否監聽，會誤報）。直接 socket 連線跨平台一致，不需
+    powershell（app 與 worker 在實際部署中同機,localhost 連得到）。
     """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.bind(("127.0.0.1", port))
-        return False            # 綁得起來 = 沒人在聽 = worker 未執行
-    except OSError:
-        return True             # 已被占用 = worker 在跑
-    finally:
-        s.close()
-
-
-def _win_port_listening(port: int) -> bool:
-    """用 powershell.exe 確認 Windows 端是否有程序監聽指定 port。
-    在 Windows 原生與 WSL2 環境下皆可呼叫。
-    """
-    try:
-        r = subprocess.run(
-            [
-                "powershell.exe", "-NoProfile", "-Command",
-                f"(Get-NetTCPConnection -LocalPort {port} -State Listen"
-                f" -ErrorAction SilentlyContinue) -ne $null",
-            ],
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=5,
-        )
-        return r.stdout.strip().upper() == "TRUE"
-    except Exception:
-        return False
+    if port is not None:
+        return stt_lock.probe(port)
+    return stt_lock.is_running(WORKER_LOCK_PORT)
 
 
 def _pid_on_port(port: int) -> int | None:
@@ -207,7 +187,7 @@ class WorkerMixin:
         兩者最終都會執行 src/worker_main.py:main()。
         """
         if _is_frozen():
-            return [sys.executable, "--worker"]
+            return [_onefile_binary(), "--worker"]
         return [sys.executable, "-m", "src.main", "--worker"]
 
     def start_worker_detached(self) -> None:
@@ -247,7 +227,9 @@ class WorkerMixin:
             self._worker_pid_file().unlink(missing_ok=True)
             return True
 
-        pid = self._read_worker_pid() or _pid_on_port(WORKER_LOCK_PORT)
+        # 回退反查 PID：用 worker 實際監聽的 port（可能已漂移過），找不到就退回 base
+        actual_port = stt_lock.running_port(WORKER_LOCK_PORT) or WORKER_LOCK_PORT
+        pid = self._read_worker_pid() or _pid_on_port(actual_port)
         if pid is None:
             logger.warning("找不到 STT worker PID，無法停止")
             return False

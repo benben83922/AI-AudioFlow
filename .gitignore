@@ -49,3 +49,5 @@ src/_bundled_assets.py
 # Nuitka 建置錯誤報告
 nuitka-crash-report.xml
 PLAUD_Note_Pro_Reverse_Engineering.md
+
+abandoned/

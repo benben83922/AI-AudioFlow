@@ -21,12 +21,16 @@ import time
 import json
 import wave
 import signal
-import socket
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
+
+try:
+    from src import stt_lock                 # 原始碼模式
+except ImportError:
+    import stt_lock                          # 打包後為頂層模組
 
 _log_file = os.environ.get("STT_LOG_FILE")
 logging.basicConfig(
@@ -248,6 +252,60 @@ def clear_progress(cfg: Config, audio: Path) -> None:
         logger.warning("清除進度標記失敗：%s", e)
 
 
+# ── 失敗標記（轉譯 / 整理）── app 端讀它把該筆顯示成「失敗」+ 提供「重試」。
+# 不留這個標記，失敗只會默默退回「待轉譯 / 待整理」，使用者無從得知。
+
+def _transcribe_error_path(cfg: Config, audio: Path) -> Path:
+    return cfg.outbox_dir / f".{audio.stem}.transcribe.error"
+
+
+def write_transcribe_error(cfg: Config, audio: Path, err) -> None:
+    data = {"stage": "transcribe", "error": str(err)[:2000], "ts": time.time()}
+    try:
+        _transcribe_error_path(cfg, audio).write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning("寫入轉譯錯誤標記失敗：%s", e)
+
+
+def clear_transcribe_error(cfg: Config, audio: Path) -> None:
+    try:
+        _transcribe_error_path(cfg, audio).unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("清除轉譯錯誤標記失敗：%s", e)
+
+
+def _summary_error_path(cfg: Config, stem: str) -> Path | None:
+    if cfg.results_dir is None:
+        return None
+    return cfg.results_dir / f".{stem}.summary.error"
+
+
+def write_summary_error(cfg: Config, stem: str, err) -> None:
+    p = _summary_error_path(cfg, stem)
+    if p is None:
+        return
+    data = {"stage": "summary", "error": str(err)[:2000], "ts": time.time()}
+    try:
+        p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        logger.warning("寫入整理錯誤標記失敗：%s", e)
+
+
+def clear_summary_error(cfg: Config, stem: str) -> None:
+    p = _summary_error_path(cfg, stem)
+    if p is None:
+        return
+    try:
+        p.unlink()
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        logger.warning("清除整理錯誤標記失敗：%s", e)
+
+
 # ── 手動觸發：轉譯請求標記（app 寫入 watch_dir，worker 取走轉譯後消費）──
 
 def _request_path(cfg: Config, audio: Path) -> Path:
@@ -307,6 +365,7 @@ def process_summary(cfg: Config, stem: str) -> None:
         return
 
     logger.info("整理中（claude -p）：%s", stem)
+    clear_summary_error(cfg, stem)               # 新嘗試：先清舊錯誤標記
     t0 = time.time()
     try:
         md = claude_cli.run(
@@ -318,7 +377,8 @@ def process_summary(cfg: Config, stem: str) -> None:
         tmp.write_text(md, encoding="utf-8")
         os.replace(tmp, out)                     # 原子化落地
     except claude_cli.ClaudeError as e:
-        logger.warning("整理失敗（%s）：%s — 留待下一輪重試", stem, e)
+        logger.warning("整理失敗（%s）：%s", stem, e)
+        write_summary_error(cfg, stem, e)        # 失敗留痕：前端顯示「失敗」並提供重試
         return
     logger.info("會議紀錄完成：%s（%.1fs）", out.name, time.time() - t0)
 
@@ -337,14 +397,18 @@ def process_file(cfg: Config, audio: Path) -> None:
 
     logger.info("轉譯中：%s", audio.name)
     t0 = time.time()
+    clear_transcribe_error(cfg, audio)  # 新嘗試：先清舊錯誤標記，狀態回到「轉譯中」
     write_progress(cfg, audio)          # 標記「開始轉譯」，供前端顯示進度
     try:
         content = _transcribe_native(cfg, audio) if cfg.backend == "native" else transcribe(cfg, audio)
         out = write_transcript(cfg, audio, content)
+    except Exception as e:
+        write_transcribe_error(cfg, audio, e)  # 失敗留痕：前端顯示「失敗」並提供重試
+        raise
     finally:
-        clear_progress(cfg, audio)      # 不論成功失敗都清掉標記（失敗下輪會重寫）
+        clear_progress(cfg, audio)      # 不論成功失敗都清掉進度標記
         if not cfg.auto:
-            clear_request(cfg, audio)   # 手動：成功 / 失敗都消費請求標記（失敗請重按）
+            clear_request(cfg, audio)   # 手動：成功 / 失敗都消費請求標記（失敗由前端重試）
     logger.info("完成：%s → %s（%.1fs）", audio.name, out.name, time.time() - t0)
     archive_source(cfg, audio)
     if cfg.auto and cfg.backend == "native":
@@ -355,29 +419,24 @@ class _Stop:
     flag = False
 
 
-def _acquire_singleton(port: int) -> socket.socket | None:
-    """綁定 localhost port 當互斥鎖；成功回傳 socket（需保持參照），失敗回傳 None。
-
-    程序結束時 OS 自動釋放 port，不會留下殘留鎖檔。app 端可用 connect 偵測是否已在跑。
-    """
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        s.bind(("127.0.0.1", port))   # 不設 SO_REUSEADDR，確保獨佔
-        s.listen(1)
-        return s
-    except OSError:
-        s.close()
-        return None
-
-
 def main() -> int:
     cfg = Config.from_env()
 
-    # 單例守衛：已有 worker 在跑就直接結束（app 每次啟動都會嘗試拉起，靠此去重）
-    lock = _acquire_singleton(cfg.lock_port)
-    if lock is None:
-        logger.info("另一個 STT worker 已在執行（port %d 被占用），本實例結束。", cfg.lock_port)
+    # 單例守衛 + 陌生程式漂移：
+    #   acquired → 綁到 port（可能因陌生程式佔用 base 而漂移到範圍內其他 port）。
+    #   running  → 範圍內已有「我們的 worker」在跑（握手辨識）→ 去重，直接結束。
+    #   blocked  → 範圍內全被非 worker 的程式佔滿 → 無法啟動，報錯結束。
+    # app 端偵測同樣掃描此範圍並靠握手認出 worker，故漂移後仍找得到，不需 port 檔。
+    lock, port, status = stt_lock.acquire(cfg.lock_port)
+    if status == "running":
+        logger.info("另一個 STT worker 已在執行（port %d），本實例結束。", port)
         return 0
+    if status == "blocked":
+        logger.error("port %d–%d 全被其他程式佔用，STT worker 無法取得單例鎖，結束。",
+                     cfg.lock_port, cfg.lock_port + stt_lock.PORT_SPAN - 1)
+        return 1
+    if port != cfg.lock_port:
+        logger.warning("單例鎖 port %d 被其他程式佔用，已改用 %d。", cfg.lock_port, port)
 
     cfg.outbox_dir.mkdir(parents=True, exist_ok=True)
     if cfg.backend == "native" and cfg.results_dir is not None:

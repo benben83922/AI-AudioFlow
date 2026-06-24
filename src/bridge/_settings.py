@@ -229,6 +229,43 @@ class SettingsMixin:
             return _err(ErrorType.INTERNAL, f"安裝未完成：{err}。可手動執行：{manual}")
         return _ok({"message": "已安裝：" + " ".join(pkgs)})
 
+    # ── 外觀偏好（主題 / 字級）──
+
+    def get_ui_prefs(self) -> dict:
+        ui = self._load_config().get("ui", {})
+        return _ok({"theme": ui.get("theme", "dark"), "font": ui.get("font", "medium")})
+
+    def set_ui_prefs(self, theme: str = "dark", font: str = "medium") -> dict:
+        theme = theme if theme in ("dark", "light") else "dark"
+        font = font if font in ("small", "medium", "large") else "medium"
+        config = self._load_config()
+        config.setdefault("ui", {})["theme"] = theme
+        config["ui"]["font"] = font
+        self._save_config(config)
+        return _ok({"theme": theme, "font": font})
+
+    # ── 整理引擎連通性測試（填完 Token / 裝完 claude 後給回饋）──
+
+    def test_summary_engine(self) -> dict:
+        """檢查「整理會議紀錄」的後端是否可用。native：claude CLI；docker：LLM 服務 /health。"""
+        if self._pipeline_mode() == "native":
+            import src.claude_cli as claude_cli
+            info = claude_cli.detect(force=True)
+            if info.get("available"):
+                return _ok({"ok": True, "message": f"Claude CLI 可用（{info.get('mode') or '原生'}）"})
+            return _err(ErrorType.VALIDATION, "未偵測到 Claude CLI（請安裝 claude 或於 WSL 登入）")
+        if not self._claude_token():
+            return _err(ErrorType.VALIDATION, "尚未填入 Claude 訂閱 Token")
+        host = self._llm_base_url().rsplit("/", 1)[0]   # .../v1 → 去掉 /v1
+        try:
+            with httpx.Client(timeout=8) as client:
+                resp = client.get(f"{host}/health")
+            if resp.status_code < 500:
+                return _ok({"ok": True, "message": f"LLM 服務可連線（HTTP {resp.status_code}）"})
+            return _err(ErrorType.CONNECTION_ERROR, f"LLM 服務回應 HTTP {resp.status_code}")
+        except Exception as e:
+            return _err(ErrorType.CONNECTION_ERROR, f"LLM 服務無法連線（請確認服務已啟動）：{e}")
+
     def test_connection(self) -> dict:
         config = self._load_config()
         webhook_url = config["storage"].get("webhook_url", "").strip()
